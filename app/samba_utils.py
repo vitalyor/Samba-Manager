@@ -463,6 +463,7 @@ def write_global_settings(settings):
             temp_path = temp_file.name
 
         success = True
+        warning_message = ""
 
         if DEV_MODE:
             # In dev mode, first update the local configuration file
@@ -472,17 +473,15 @@ def write_global_settings(settings):
 
             if local_result.returncode != 0:
                 print(f"Error writing to local config: {local_result.stderr}")
-                success = False
+                return False, f"Error writing local Samba config: {local_result.stderr.strip()}"
 
             # Also try to update the system config if we have sudo access
             try:
-                # Check if we have sudo access
                 sudo_check = subprocess.run(
                     ["sudo", "-n", "true"], capture_output=True, text=True, check=False
                 )
 
                 if sudo_check.returncode == 0:
-                    # We have sudo access, update the system config
                     system_result = subprocess.run(
                         ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
                         capture_output=True,
@@ -493,7 +492,6 @@ def write_global_settings(settings):
                     if system_result.returncode == 0:
                         print("Updated system Samba configuration")
 
-                        # Also update the system shares.conf
                         with open("./shares.conf", "r") as local_shares:
                             local_shares_content = local_shares.read()
 
@@ -515,29 +513,35 @@ def write_global_settings(settings):
                         if shares_result.returncode == 0:
                             print("Updated system shares configuration")
 
-                            # Restart the system services
-                            restart_result = subprocess.run(
-                                ["sudo", "systemctl", "restart", "smbd", "nmbd"],
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                            )
-
-                            if restart_result.returncode == 0:
-                                print("Restarted system Samba services")
-                            else:
-                                print(
-                                    f"Failed to restart system services: {restart_result.stderr}"
+                            restart_result = restart_samba_service()
+                            if not restart_result:
+                                warning_message = (
+                                    "Configuration saved locally, but Samba could not be restarted on the system. "
+                                    "Check logs for service restart details."
                                 )
+                        else:
+                            print(
+                                f"Failed to update system shares config: {shares_result.stderr}"
+                            )
+                            warning_message = (
+                                "Configuration saved locally, but system shares configuration was not updated. "
+                                "Check logs for details."
+                            )
                     else:
                         print(f"Failed to update system config: {system_result.stderr}")
+                        warning_message = (
+                            "Configuration saved locally, but system Samba config could not be updated. "
+                            "Check logs for details."
+                        )
                 else:
                     print("No sudo access available, skipping system config update")
             except Exception as sudo_error:
                 print(f"Error updating system config: {str(sudo_error)}")
-                # Continue with local config only
+                warning_message = (
+                    "Configuration saved locally, but system Samba config update failed. "
+                    "Check logs for details."
+                )
         else:
-            # In production mode, use sudo for the system config
             system_result = subprocess.run(
                 ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
                 capture_output=True,
@@ -547,11 +551,11 @@ def write_global_settings(settings):
 
             if system_result.returncode != 0:
                 print(f"Error writing config: {system_result.stderr}")
-                success = False
+                os.unlink(temp_path)
+                return False, f"Error writing system Samba config: {system_result.stderr.strip()}"
             else:
                 print("Updated system Samba configuration")
 
-                # Also update the local copy for reference
                 try:
                     local_result = subprocess.run(
                         ["cp", temp_path, "./smb.conf"],
@@ -564,20 +568,14 @@ def write_global_settings(settings):
                 except Exception as e:
                     print(f"Error updating local copy: {str(e)}")
 
-        # Clean up the temporary file
         os.unlink(temp_path)
-
-        if not success:
-            return False
 
         # Validate the configuration
         if DEV_MODE:
-            # In dev mode, check if testparm is available
             testparm_check = subprocess.run(
                 ["which", "testparm"], capture_output=True, text=True, check=False
             )
             if testparm_check.returncode == 0:
-                # testparm is available, validate the local config
                 validate_cmd = subprocess.run(
                     ["testparm", "-s", SMB_CONF],
                     capture_output=True,
@@ -585,19 +583,16 @@ def write_global_settings(settings):
                     check=False,
                 )
                 if validate_cmd.returncode != 0:
-                    # If validation fails, restore the backup
                     subprocess.run(["cp", backup_path, SMB_CONF], check=False)
                     print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False
+                    return False, f"Invalid Samba configuration: {validate_cmd.stderr.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in dev mode")
         else:
-            # In production mode, check if testparm is available
             testparm_check = subprocess.run(
                 ["which", "testparm"], capture_output=True, text=True, check=False
             )
             if testparm_check.returncode == 0:
-                # testparm is available, validate the system config
                 validate_cmd = subprocess.run(
                     ["sudo", "testparm", "-s", "/etc/samba/smb.conf"],
                     capture_output=True,
@@ -606,41 +601,34 @@ def write_global_settings(settings):
                 )
 
                 if validate_cmd.returncode != 0:
-                    # If validation fails, restore the backup
                     subprocess.run(
                         ["sudo", "cp", backup_path, "/etc/samba/smb.conf"], check=False
                     )
                     print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False
+                    return False, f"Invalid Samba configuration: {validate_cmd.stderr.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in production mode")
 
-        # Restart Samba services
         if DEV_MODE:
-            # In development mode, we already tried to restart the system services if we had sudo access
+            if warning_message:
+                print("Development mode: Local configuration updated successfully with warnings")
+                return True, warning_message
             print("Development mode: Local configuration updated successfully")
-        else:
-            # In production mode, restart the services
-            restart_cmd = subprocess.run(
-                ["sudo", "systemctl", "restart", "smbd", "nmbd"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            return True, ""
 
-            if restart_cmd.returncode != 0:
-                print(f"Error restarting services: {restart_cmd.stderr}")
-                return False
-            else:
-                print("Restarted system Samba services")
+        restart_result = restart_samba_service()
+        if not restart_result:
+            print("Error restarting Samba services")
+            return False, "Saved configuration, but Samba service restart failed. Check logs for details."
 
-        return True
+        print("Restarted system Samba services")
+        return True, ""
     except Exception as e:
         print(f"Exception in write_global_settings: {str(e)}")
         import traceback
 
         traceback.print_exc()
-        return False
+        return False, "Exception writing Samba settings. Check logs for details."
 
 
 def parse_user_group_list(value):

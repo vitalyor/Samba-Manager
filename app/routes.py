@@ -182,12 +182,15 @@ def global_settings():
         settings["hosts allow"] = request.form.get("hosts_allow", "")
         settings["hosts deny"] = request.form.get("hosts_deny", "")
 
-        result = write_global_settings(settings)
+        success, message = write_global_settings(settings)
 
-        if result:
-            flash("Settings saved and Samba service restarted", "success")
+        if success:
+            if message:
+                flash(f"Settings saved. {message}", "warning")
+            else:
+                flash("Settings saved and Samba service restarted", "success")
         else:
-            flash("Failed to save settings. Check logs for details", "error")
+            flash(message or "Failed to save settings. Check logs for details", "error")
 
         return redirect("/global-settings")
 
@@ -821,7 +824,10 @@ def quick_setup():
             "map to guest": "Bad User" if guest_access == "yes" else "Never",
         }
 
-        write_global_settings(global_settings)
+        success, message = write_global_settings(global_settings)
+        if not success:
+            flash(message or "Failed to save Samba global settings during quick setup.", "error")
+            return redirect("/setup")
 
         # Create share
         share = {

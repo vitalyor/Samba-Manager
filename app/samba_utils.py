@@ -2642,7 +2642,7 @@ def terminate_connection(pid):
 
         # Verify that the PID belongs to a Samba process
         result = subprocess.run(
-            ["sudo", "ps", "-p", pid, "-o", "comm="],
+            with_privilege(["ps", "-p", pid, "-o", "comm="]),
             capture_output=True,
             text=True,
             check=False,
@@ -2658,7 +2658,7 @@ def terminate_connection(pid):
         try:
             # Get smbstatus output
             status_result = subprocess.run(
-                ["sudo", "smbstatus"], capture_output=True, text=True, check=False
+                with_privilege(["smbstatus"]), capture_output=True, text=True, check=False
             )
 
             if status_result.returncode == 0:
@@ -2676,19 +2676,19 @@ def terminate_connection(pid):
 
         # Try to kill the process with SIGTERM first
         kill_result = subprocess.run(
-            ["sudo", "kill", "-TERM", pid], capture_output=True, text=True, check=False
+            with_privilege(["kill", "-TERM", pid]), capture_output=True, text=True, check=False
         )
 
         # Check if the process is still running
         check_result = subprocess.run(
-            ["sudo", "ps", "-p", pid], capture_output=True, text=True, check=False
+            with_privilege(["ps", "-p", pid]), capture_output=True, text=True, check=False
         )
 
         # If process still exists, try SIGKILL
         if check_result.returncode == 0:
             print(f"Process {pid} still running after SIGTERM, trying SIGKILL")
             kill_result = subprocess.run(
-                ["sudo", "kill", "-KILL", pid],
+                with_privilege(["kill", "-KILL", pid]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2700,7 +2700,7 @@ def terminate_connection(pid):
                 print(f"Attempting to force disconnect machine: {machine_name}")
                 # Use smbcontrol to force disconnect the client
                 smbcontrol_result = subprocess.run(
-                    ["sudo", "smbcontrol", "smbd", "close-share", machine_name],
+                    with_privilege(["smbcontrol", "smbd", "close-share", machine_name]),
                     capture_output=True,
                     text=True,
                     check=False,
@@ -2712,7 +2712,7 @@ def terminate_connection(pid):
 
         # Final check if the process is still running
         final_check = subprocess.run(
-            ["sudo", "ps", "-p", pid], capture_output=True, text=True, check=False
+            with_privilege(["ps", "-p", pid]), capture_output=True, text=True, check=False
         )
 
         if final_check.returncode == 0:
@@ -2738,7 +2738,7 @@ def terminate_connection_by_machine(machine):
             print(f"Attempting to force disconnect machine: {machine}")
             # Use smbcontrol to force disconnect the client
             smbcontrol_result = subprocess.run(
-                ["sudo", "smbcontrol", "smbd", "close-share", machine],
+                with_privilege(["smbcontrol", "smbd", "close-share", machine]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2757,7 +2757,7 @@ def terminate_connection_by_machine(machine):
         try:
             # Get smbstatus output
             status_result = subprocess.run(
-                ["sudo", "smbstatus"], capture_output=True, text=True, check=False
+                with_privilege(["smbstatus"]), capture_output=True, text=True, check=False
             )
 
             if status_result.returncode == 0:
@@ -2783,7 +2783,7 @@ def terminate_connection_by_machine(machine):
                 # Kill all PIDs associated with this machine
                 for pid in pids_to_kill:
                     print(f"Killing PID {pid} associated with machine {machine}")
-                    subprocess.run(["sudo", "kill", "-KILL", pid], check=False)
+                    subprocess.run(with_privilege(["kill", "-KILL", pid]), check=False)
         except Exception as e:
             print(f"Error killing PIDs for machine {machine}: {str(e)}")
 
@@ -2798,7 +2798,7 @@ def get_active_connections():
     try:
         # Use smbstatus to get active connections
         result = subprocess.run(
-            ["sudo", "smbstatus"], capture_output=True, text=True, check=True
+            with_privilege(["smbstatus"]), capture_output=True, text=True, check=True
         )
 
         output = result.stdout.strip()
@@ -2963,6 +2963,17 @@ def prepare_share_for_unplug(share_name):
     """Terminate active SMB sessions for a share before disk unplug/unmount."""
     if not share_name:
         return False, "Share name is required"
+
+    # First ask smbd to close this specific share for all clients.
+    try:
+        subprocess.run(
+            with_privilege(["smbcontrol", "smbd", "close-share", share_name]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        pass
 
     conn_state = get_active_connections()
     connections = conn_state.get("connections", [])

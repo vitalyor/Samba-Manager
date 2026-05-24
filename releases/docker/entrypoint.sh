@@ -62,6 +62,41 @@ if [ ! -f /etc/samba/shares.conf ]; then
 EOF
 fi
 
+# Bootstrap ADMIN user for Unix + Samba if env provided
+ADMIN_USERNAME="${ADMIN_USERNAME:-}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+ADMIN_UID="${ADMIN_UID:-}"
+ADMIN_GID="${ADMIN_GID:-}"
+
+if [ -n "$ADMIN_USERNAME" ] && [ -n "$ADMIN_PASSWORD" ]; then
+    if ! getent passwd "$ADMIN_USERNAME" >/dev/null 2>&1; then
+        USERADD_ARGS="-m -s /bin/bash"
+        if [ -n "$ADMIN_UID" ] && echo "$ADMIN_UID" | grep -Eq '^[0-9]+$'; then
+            USERADD_ARGS="$USERADD_ARGS -u $ADMIN_UID"
+        fi
+        if [ -n "$ADMIN_GID" ] && echo "$ADMIN_GID" | grep -Eq '^[0-9]+$'; then
+            if ! getent group "$ADMIN_GID" >/dev/null 2>&1; then
+                groupadd -g "$ADMIN_GID" "$ADMIN_USERNAME" || true
+            fi
+            USERADD_ARGS="$USERADD_ARGS -g $ADMIN_GID"
+        else
+            USERADD_ARGS="$USERADD_ARGS -U"
+        fi
+        # shellcheck disable=SC2086
+        useradd $USERADD_ARGS "$ADMIN_USERNAME"
+    fi
+
+    getent group smbusers >/dev/null 2>&1 || groupadd smbusers || true
+    usermod -aG smbusers "$ADMIN_USERNAME" || true
+
+    if pdbedit -L -u "$ADMIN_USERNAME" >/dev/null 2>&1; then
+        printf '%s\n%s\n' "$ADMIN_PASSWORD" "$ADMIN_PASSWORD" | smbpasswd -s "$ADMIN_USERNAME"
+    else
+        printf '%s\n%s\n' "$ADMIN_PASSWORD" "$ADMIN_PASSWORD" | smbpasswd -s -a "$ADMIN_USERNAME"
+    fi
+    smbpasswd -e "$ADMIN_USERNAME" >/dev/null 2>&1 || true
+fi
+
 # Validate configuration before booting daemons
 echo "Validating Samba configuration with testparm..."
 if ! testparm -s /etc/samba/smb.conf >/tmp/testparm.out 2>/tmp/testparm.err; then

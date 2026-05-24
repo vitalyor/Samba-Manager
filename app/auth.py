@@ -44,6 +44,33 @@ def _ensure_users_file():
 _ensure_users_file()
 
 
+def _bootstrap_admin_from_env():
+    username = (os.environ.get("ADMIN_USERNAME") or "").strip()
+    password = os.environ.get("ADMIN_PASSWORD") or ""
+    if not username or not password:
+        return
+
+    users = {}
+    try:
+        with open(USERS_FILE, "r") as f:
+            users = json.load(f) or {}
+    except Exception:
+        users = {}
+
+    if username in users:
+        return
+
+    users[username] = {
+        "password": generate_password_hash(password),
+        "is_admin": True,
+    }
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=4)
+
+
+_bootstrap_admin_from_env()
+
+
 class User(UserMixin):
     def __init__(self, username, is_admin=False):
         self.id = username

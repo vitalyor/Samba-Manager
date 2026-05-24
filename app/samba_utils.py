@@ -96,6 +96,46 @@ def parse_config_content(content):
     return sections
 
 
+def render_config_sections(sections, include_path=None):
+    """Render Samba config sections with [global] first and include last in [global]."""
+    output = []
+    ordered_section_names = []
+    if "global" in sections:
+        ordered_section_names.append("global")
+    ordered_section_names.extend(
+        [name for name in sections.keys() if name != "global"]
+    )
+
+    for section_name in ordered_section_names:
+        section_params = dict(sections.get(section_name, {}))
+        output.append(f"[{section_name}]")
+
+        if section_name == "global":
+            if include_path:
+                # Keep include strictly as the last directive in [global]
+                section_params.pop("include", None)
+            for param_name, param_value in section_params.items():
+                output.append(f"    {param_name} = {param_value}")
+            if include_path:
+                output.append(f"    include = {include_path}")
+        else:
+            for param_name, param_value in section_params.items():
+                output.append(f"    {param_name} = {param_value}")
+
+        output.append("")
+
+    return "\n".join(output).rstrip() + "\n"
+
+
+def testparm_has_warnings_or_service_section_error(output_text):
+    lowered = (output_text or "").lower()
+    if "warning" in lowered:
+        return True
+    if "global parameter" in lowered and "service section" in lowered:
+        return True
+    return False
+
+
 # Function to auto-detect share directories
 def detect_share_directories():
     """Auto-detect existing share directories on the system"""
@@ -460,13 +500,8 @@ def write_global_settings(settings):
             else:
                 sections["global"]["include"] = "/etc/samba/shares.conf"
 
-        # Convert the sections back to a configuration string
-        new_config = ""
-        for section_name, section_params in sections.items():
-            new_config += f"[{section_name}]\n"
-            for param_name, param_value in section_params.items():
-                new_config += f"    {param_name} = {param_value}\n"
-            new_config += "\n"
+        include_path = "./shares.conf" if DEV_MODE else "/etc/samba/shares.conf"
+        new_config = render_config_sections(sections, include_path=include_path)
 
         # Write the configuration to a temporary file
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
@@ -593,10 +628,15 @@ def write_global_settings(settings):
                     text=True,
                     check=False,
                 )
-                if validate_cmd.returncode != 0:
+                validate_output = (validate_cmd.stdout or "") + "\n" + (
+                    validate_cmd.stderr or ""
+                )
+                if validate_cmd.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                    validate_output
+                ):
                     subprocess.run(["cp", backup_path, SMB_CONF], check=False)
-                    print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False, f"Invalid Samba configuration: {validate_cmd.stderr.strip()}"
+                    print(f"Invalid configuration: {validate_output}")
+                    return False, f"Invalid Samba configuration: {validate_output.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in dev mode")
         else:
@@ -611,12 +651,17 @@ def write_global_settings(settings):
                     check=False,
                 )
 
-                if validate_cmd.returncode != 0:
+                validate_output = (validate_cmd.stdout or "") + "\n" + (
+                    validate_cmd.stderr or ""
+                )
+                if validate_cmd.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                    validate_output
+                ):
                     subprocess.run(
                         ["sudo", "cp", backup_path, "/etc/samba/smb.conf"], check=False
                     )
-                    print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False, f"Invalid Samba configuration: {validate_cmd.stderr.strip()}"
+                    print(f"Invalid configuration: {validate_output}")
+                    return False, f"Invalid Samba configuration: {validate_output.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in production mode")
 
@@ -1146,18 +1191,15 @@ def save_shares(shares):
                     content = f.read()
                 include_path = SHARE_CONF
 
-            if f"include = {include_path}" not in content:
-                print(f"Adding include directive to main config")
-                # Create a temporary file with updated content
+            sections = parse_config_content(content)
+            if "global" not in sections:
+                sections["global"] = {}
+            sections["global"]["include"] = include_path
+
+            new_content = render_config_sections(sections, include_path=include_path)
+            if new_content != content:
+                print(f"Adding/updating include directive in main config")
                 with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
-                    if "[global]" in content:
-                        new_content = content.replace(
-                            "[global]", f"[global]\n   include = {include_path}"
-                        )
-                    else:
-                        new_content = (
-                            f"[global]\n   include = {include_path}\n\n{content}"
-                        )
                     temp_file.write(new_content)
                     temp_path = temp_file.name
 
@@ -1185,7 +1227,7 @@ def save_shares(shares):
                     subprocess.run(["sudo", "chmod", "644", SMB_CONF], check=True)
 
                 os.unlink(temp_path)  # Remove the temp file
-                print(f"Added include directive to main config")
+                print(f"Updated include directive placement in main config")
         except Exception as e:
             print(f"Warning: Could not update include directive: {e}")
 
@@ -1195,11 +1237,14 @@ def save_shares(shares):
             validate_result = subprocess.run(
                 validate_cmd, capture_output=True, text=True, check=False
             )
-            if validate_result.returncode != 0:
-                print(
-                    f"Warning: Samba configuration validation failed: {validate_result.stderr}"
-                )
-                set_last_error(validate_result.stderr)
+            validate_output = (validate_result.stdout or "") + "\n" + (
+                validate_result.stderr or ""
+            )
+            if validate_result.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                validate_output
+            ):
+                print(f"Samba configuration validation failed: {validate_output}")
+                set_last_error(validate_output)
                 return False
         except Exception as e:
             print(f"Warning: Could not validate configuration: {e}")

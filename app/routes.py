@@ -333,7 +333,11 @@ def add_share():
         "force_user": request.form.get("force_user", "").strip(),
         "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
+        "access_mode": request.form.get("access_mode", "auto").strip().lower(),
     }
+    share, policy_note = apply_share_access_policy(share)
+    if policy_note:
+        flash(policy_note, "warning")
 
     result = add_or_update_share(share)
     if result:
@@ -413,7 +417,11 @@ def edit_share():
         "force_user": request.form.get("force_user", "").strip(),
         "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
+        "access_mode": request.form.get("access_mode", "auto").strip().lower(),
     }
+    share, policy_note = apply_share_access_policy(share)
+    if policy_note:
+        flash(policy_note, "warning")
 
     # If name was changed, delete the old share first
     if original_name != name:
@@ -457,6 +465,28 @@ def delete_share_route():
         flash("Failed to delete share", "error")
 
     # Force a page refresh to update the UI
+    return redirect("/shares")
+
+
+@bp.route("/shares/prepare-unplug", methods=["POST"])
+@login_required
+def prepare_unplug_share_route():
+    if not check_sudo_access():
+        flash("Error: Sudo access is required to prepare share for unplug", "error")
+        return redirect("/shares")
+
+    share_name = request.form.get("name", "").strip()
+    if not share_name:
+        flash("Share name is required", "error")
+        return redirect("/shares")
+
+    # Prevent operations on internal protected shares.
+    if share_name in ["secure-share", "share"]:
+        flash("System share does not need unplug preparation", "warning")
+        return redirect("/shares")
+
+    ok, message = prepare_share_for_unplug(share_name)
+    flash(message, "success" if ok else "error")
     return redirect("/shares")
 
 

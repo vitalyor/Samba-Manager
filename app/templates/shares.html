@@ -66,6 +66,15 @@
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#editShareModal{{ share.name }}">
                   <i class="bi bi-pencil"></i>
                 </button>
+                {% if share.name not in ['share', 'secure-share'] %}
+                <form action="/shares/prepare-unplug" method="post" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                  <input type="hidden" name="name" value="{{ share.name }}">
+                  <button type="submit" class="btn btn-sm btn-outline-warning" title="Prepare for unplug" onclick="return confirm('Disconnect SMB clients from {{ share.name }} before unplugging disk?')">
+                    <i class="bi bi-eject"></i>
+                  </button>
+                </form>
+                {% endif %}
                 <button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteShareModal{{ share.name }}">
                   <i class="bi bi-trash"></i>
                 </button>
@@ -181,6 +190,15 @@
           <div class="mb-3">
             <label for="force_group{{ share.name }}" class="form-label">Force Group (optional)</label>
             <input type="text" class="form-control" id="force_group{{ share.name }}" name="force_group" value="{{ share.force_group|default('') }}">
+          </div>
+
+          <div class="mb-3">
+            <label for="access_mode{{ share.name }}" class="form-label">Access Mode</label>
+            <select class="form-select" id="access_mode{{ share.name }}" name="access_mode">
+              <option value="auto" {% if not share.force_user and not share.force_group %}selected{% endif %}>Auto (recommended for external disks)</option>
+              <option value="manual" {% if share.force_user or share.force_group %}selected{% endif %}>Manual (use Force User/Group exactly as entered)</option>
+            </select>
+            <div class="form-text help-text">Auto never changes ownership on disk; it only sets Samba runtime mapping if needed.</div>
           </div>
           
           <div class="mb-3">
@@ -340,6 +358,15 @@
           <div class="mb-3">
             <label for="force_group" class="form-label">Force Group (optional)</label>
             <input type="text" class="form-control" id="force_group" name="force_group">
+          </div>
+
+          <div class="mb-3">
+            <label for="access_mode" class="form-label">Access Mode</label>
+            <select class="form-select" id="access_mode" name="access_mode">
+              <option value="auto" selected>Auto (recommended for external disks)</option>
+              <option value="manual">Manual (use Force User/Group exactly as entered)</option>
+            </select>
+            <div class="form-text help-text">Auto never changes ownership on disk; it only sets Samba runtime mapping if needed.</div>
           </div>
           
           <div class="mb-3">

@@ -5,6 +5,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 # Use local configuration files for development
@@ -835,6 +836,85 @@ def format_user_group_list(users, groups):
             all_items.append(groups)
 
     return " ".join(all_items) if all_items else ""
+
+
+def _extract_plain_users(principal_string):
+    items = [item.strip() for item in re.split(r"[\s,]+", principal_string or "") if item.strip()]
+    return [item for item in items if not item.startswith("@")]
+
+
+def _user_can_write_path(username, path):
+    try:
+        user_info = pwd.getpwnam(username)
+    except KeyError:
+        return False
+
+    try:
+        st = os.stat(path)
+    except Exception:
+        return False
+
+    user_uid = user_info.pw_uid
+    user_gid = user_info.pw_gid
+    user_groups = set()
+    try:
+        user_groups = {g.gr_gid for g in grp.getgrall() if username in g.gr_mem}
+    except Exception:
+        user_groups = set()
+    user_groups.add(user_gid)
+
+    if st.st_uid == user_uid and (st.st_mode & 0o200):
+        return True
+    if st.st_gid in user_groups and (st.st_mode & 0o020):
+        return True
+    if st.st_mode & 0o002:
+        return True
+    return False
+
+
+def apply_share_access_policy(share):
+    """Auto-apply a safe access policy for external disks without mutating FS ownership.
+
+    Modes:
+    - auto (default): keep force fields empty when user can write; fallback to force user=root.
+    - manual: keep user-provided force user/group unchanged.
+    """
+    mode = (share.get("access_mode") or os.environ.get("SAMBA_MANAGER_SHARE_ACCESS_MODE", "auto")).strip().lower()
+    if mode not in {"auto", "manual"}:
+        mode = "auto"
+    share["access_mode"] = mode
+
+    if mode == "manual":
+        return share, ""
+
+    # In auto mode, explicit force values mean "manual intent".
+    if share.get("force_user") or share.get("force_group"):
+        return share, ""
+
+    if str(share.get("read_only", "no")).lower() == "yes":
+        return share, ""
+
+    path = (share.get("path") or "").strip()
+    if not path:
+        return share, ""
+
+    candidate_users = []
+    candidate_users.extend(_extract_plain_users(share.get("write_list", "")))
+    candidate_users.extend(_extract_plain_users(share.get("valid_users", "")))
+    # Preserve order + uniq
+    candidate_users = list(dict.fromkeys(candidate_users))
+
+    if any(_user_can_write_path(user, path) for user in candidate_users):
+        return share, ""
+
+    # Fallback for host-mounted disks with foreign UID ownership.
+    share["force_user"] = "root"
+    if not share.get("force_group"):
+        share["force_group"] = ""
+    return share, (
+        "Auto access mode enabled: path is not writable by selected Samba users, "
+        "so `force user = root` was applied without changing disk ownership."
+    )
 
 
 def load_shares():
@@ -2877,6 +2957,55 @@ def get_active_connections():
             "processes": [],
             "connections": [],
         }
+
+
+def prepare_share_for_unplug(share_name):
+    """Terminate active SMB sessions for a share before disk unplug/unmount."""
+    if not share_name:
+        return False, "Share name is required"
+
+    conn_state = get_active_connections()
+    connections = conn_state.get("connections", [])
+    share_connections = [c for c in connections if (c.get("service") or "") == share_name]
+
+    if not share_connections:
+        return True, f'No active SMB clients on "{share_name}". Safe to unmount if no local processes use the disk.'
+
+    terminated = 0
+    failures = []
+    seen_pids = set()
+
+    for conn in share_connections:
+        pid = str(conn.get("pid") or "").strip()
+        if not pid or pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        ok, msg = terminate_connection(pid)
+        if ok:
+            terminated += 1
+        else:
+            failures.append(msg)
+
+    # Give smbd a short moment to release handles and refresh state.
+    time.sleep(0.6)
+    remaining = [
+        c for c in get_active_connections().get("connections", []) if (c.get("service") or "") == share_name
+    ]
+    if remaining:
+        return (
+            False,
+            f'Closed {terminated} connection(s), but {len(remaining)} still active on "{share_name}". '
+            "Try again in a few seconds or disconnect clients manually from Connections page.",
+        )
+
+    if failures:
+        return (
+            True,
+            f'Closed {terminated} connection(s) on "{share_name}". '
+            "Some disconnect attempts reported warnings, but no active sessions remain.",
+        )
+
+    return True, f'Closed {terminated} connection(s) on "{share_name}". You can now unmount/eject the disk.'
 
 
 def get_share_usage_stats():

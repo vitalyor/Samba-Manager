@@ -1853,27 +1853,49 @@ def add_samba_user(username, password, create_system_user=False):
     try:
         set_last_error("")
 
+        def linux_user_exists(target_user):
+            return (
+                subprocess.run(
+                    ["getent", "passwd", target_user],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).returncode
+                == 0
+            )
+
+        def validate_passdb_uid_integrity():
+            ok, output = run_command(with_privilege(["pdbedit", "-L"]))
+            if not ok:
+                return True
+            for line in output.splitlines():
+                if ":4294967295:" in line:
+                    set_last_error(
+                        "Samba passdb contains invalid UID 4294967295. "
+                        "Fix system user UID/GID mapping before enabling Samba user."
+                    )
+                    return False
+            return True
+
         def samba_user_exists(target_user):
             probe = subprocess.run(
-                ["sudo", "pdbedit", "-L", "-u", target_user],
+                with_privilege(["pdbedit", "-L", "-u", target_user]),
                 capture_output=True,
                 text=True,
                 check=False,
             )
             return probe.returncode == 0
 
-        # Check if system user exists
-        check_user = subprocess.run(
-            ["id", username], capture_output=True, text=True, check=False
-        )
-        user_exists = check_user.returncode == 0
-
-        # Create system user if requested and doesn't exist
-        if not user_exists and create_system_user:
+        # Ensure Linux user exists before any smbpasswd operation.
+        user_exists = linux_user_exists(username)
+        if not user_exists:
             print(f"Creating system user: {username}")
-            create_cmd = ["sudo", "useradd", "-m", "-s", "/bin/bash"]
+            create_cmd = with_privilege(["useradd", "-m", "-s", "/bin/bash"])
+
+            # Stable UID/GID for predictable Docker/CasaOS behavior.
             uid = os.environ.get("SAMBA_DEFAULT_UID", "").strip()
             gid = os.environ.get("SAMBA_DEFAULT_GID", "").strip()
+
             if uid.isdigit():
                 create_cmd.extend(["-u", uid])
             if gid.isdigit():
@@ -1895,7 +1917,7 @@ def add_samba_user(username, password, create_system_user=False):
 
             # Set system password
             set_pass = subprocess.Popen(
-                ["sudo", "chpasswd"],
+                with_privilege(["chpasswd"]),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1907,9 +1929,10 @@ def add_samba_user(username, password, create_system_user=False):
                 set_last_error(stderr.strip())
                 return False
 
+        user_exists = linux_user_exists(username)
         if not user_exists:
             set_last_error(
-                "System user does not exist. Enable 'Create system user' or create it manually."
+                "System user does not exist and could not be created."
             )
             return False
 
@@ -1920,7 +1943,7 @@ def add_samba_user(username, password, create_system_user=False):
         if check_group.returncode != 0:
             print("Creating smbusers group")
             create_group = subprocess.run(
-                ["sudo", "groupadd", "smbusers"],
+                with_privilege(["groupadd", "smbusers"]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1932,7 +1955,7 @@ def add_samba_user(username, password, create_system_user=False):
         if user_exists or create_system_user:
             print(f"Adding {username} to smbusers group")
             add_to_group = subprocess.run(
-                ["sudo", "usermod", "-aG", "smbusers", username],
+                with_privilege(["usermod", "-aG", "smbusers", username]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1940,11 +1963,14 @@ def add_samba_user(username, password, create_system_user=False):
             if add_to_group.returncode != 0:
                 print(f"Failed to add user to smbusers group: {add_to_group.stderr}")
 
+        if not validate_passdb_uid_integrity():
+            return False
+
         # Add Samba user
         if samba_user_exists(username):
             print(f"Samba user {username} exists, resetting password")
             process = subprocess.Popen(
-                ["sudo", "smbpasswd", "-s", username],
+                with_privilege(["smbpasswd", "-s", username]),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1953,7 +1979,7 @@ def add_samba_user(username, password, create_system_user=False):
         else:
             print(f"Creating Samba user: {username}")
             process = subprocess.Popen(
-                ["sudo", "smbpasswd", "-s", "-a", username],
+                with_privilege(["smbpasswd", "-s", "-a", username]),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1969,7 +1995,7 @@ def add_samba_user(username, password, create_system_user=False):
         # Enable the Samba user
         print("Enabling Samba user")
         enable = subprocess.run(
-            ["sudo", "smbpasswd", "-e", username],
+            with_privilege(["smbpasswd", "-e", username]),
             capture_output=True,
             text=True,
             check=False,

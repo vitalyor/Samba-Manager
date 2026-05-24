@@ -2335,6 +2335,7 @@ def get_samba_installation_status():
         "installed": False,
         "running": False,
         "configured": False,
+        "config_exists": False,
         "shares": [],
         "users": [],
     }
@@ -2353,6 +2354,7 @@ def get_samba_installation_status():
 
         # Check if Samba is configured
         status["configured"] = os.path.exists(ACTUAL_SMB_CONF)
+        status["config_exists"] = status["configured"]
 
         # Get shares
         status["shares"] = load_shares()

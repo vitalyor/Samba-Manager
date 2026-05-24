@@ -356,7 +356,7 @@
     </div>
   </div>
 </div>
-{% endblock %}
+{# endblock moved to end to keep modal+script rendered in this template #}
 
 <!-- Directory Browser Modal -->
 <div class="modal fade" id="directoryBrowserModal" tabindex="-1" aria-labelledby="directoryBrowserModalLabel" aria-hidden="true">
@@ -498,3 +498,4 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 </script>
+{% endblock %}

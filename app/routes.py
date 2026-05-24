@@ -87,6 +87,15 @@ def validate_share_path(path):
     if ".." in abs_path or not abs_path.startswith("/"):
         return False, "Invalid path - directory traversal not allowed"
 
+    # Docker/CasaOS UX hint: users often provide host path inside container
+    if abs_path.startswith("/media/devmon/") and not os.path.exists(abs_path):
+        suggested = abs_path.replace("/media/devmon/", "/shares/", 1)
+        if os.path.exists("/shares") and os.path.exists(suggested):
+            return (
+                False,
+                f'Path "{abs_path}" not found in container. Try container path "{suggested}"',
+            )
+
     # Check if path exists and is a directory
     if not os.path.exists(abs_path):
         return False, "Path does not exist"
@@ -114,6 +123,29 @@ def validate_share_path(path):
             return False, f"Cannot use system directory: {sensitive}"
 
     return True, f"Path validated: {abs_path}"
+
+
+def _split_principals(raw_value):
+    return [item.strip() for item in re.split(r"[\s,]+", raw_value or "") if item.strip()]
+
+
+def _normalize_group_name(group):
+    g = (group or "").strip()
+    if not g:
+        return ""
+    return g if g.startswith("@") else f"@{g}"
+
+
+def _build_principal_list(users_raw, groups_raw):
+    users = [u for u in _split_principals(users_raw) if not u.startswith("@")]
+    groups = [_normalize_group_name(g) for g in groups_raw if _normalize_group_name(g)]
+    unique = []
+    seen = set()
+    for principal in users + groups:
+        if principal not in seen:
+            seen.add(principal)
+            unique.append(principal)
+    return " ".join(unique)
 
 
 @bp.route("/")
@@ -213,11 +245,12 @@ def global_settings():
 def shares():
     has_sudo = check_sudo_access()
     all_shares = load_shares()
+    hide_system_shares = os.environ.get("SAMBA_MANAGER_HIDE_SYSTEM_SHARES", "0") == "1"
 
     # Sort shares: system shares first, then local shares
     system_shares = [s for s in all_shares if s["name"] in ["secure-share", "share"]]
     local_shares = [s for s in all_shares if s["name"] not in ["secure-share", "share"]]
-    sorted_shares = system_shares + local_shares
+    sorted_shares = local_shares if hide_system_shares else (system_shares + local_shares)
 
     return render_template(
         "shares.html",
@@ -265,27 +298,24 @@ def add_share():
         flash(f"Invalid path: {message}", "error")
         return redirect("/shares")
 
-    # Process users and groups
-    valid_users = request.form.get("valid_users", "")
-    valid_groups = request.form.getlist("valid_groups")
+    # Process users/groups into Samba principal lists
+    valid_users = _build_principal_list(
+        request.form.get("valid_users", ""), request.form.getlist("valid_groups")
+    )
+    write_list = _build_principal_list(
+        request.form.get("write_list", ""), request.form.getlist("write_groups")
+    )
+    guest_ok = "yes" if request.form.get("guest_ok") else "no"
+    if guest_ok == "no" and not valid_users:
+        flash("For non-guest share, specify at least one valid user or group.", "error")
+        return redirect("/shares")
 
-    # Combine users and groups for valid_users field
-    if valid_groups:
-        if valid_users:
-            valid_users = valid_users + "," + ",".join(valid_groups)
-        else:
-            valid_users = ",".join(valid_groups)
-
-    # Process write list users and groups
-    write_list = request.form.get("write_list", "")
-    write_groups = request.form.getlist("write_groups")
-
-    # Combine users and groups for write_list field
-    if write_groups:
-        if write_list:
-            write_list = write_list + "," + ",".join(write_groups)
-        else:
-            write_list = ",".join(write_groups)
+    create_mask = request.form.get("create_mask", "").strip()
+    directory_mask = request.form.get("directory_mask", "").strip()
+    if not create_mask:
+        create_mask = "0664" if guest_ok == "no" else "0666"
+    if not directory_mask:
+        directory_mask = "0775" if guest_ok == "no" else "0777"
 
     # Create new share with normalized key names
     share = {
@@ -294,12 +324,13 @@ def add_share():
         "comment": request.form.get("comment", ""),
         "browseable": "yes" if request.form.get("browseable") else "no",
         "read_only": "yes" if request.form.get("read_only") else "no",
-        "guest_ok": "yes" if request.form.get("guest_ok") else "no",
+        "guest_ok": guest_ok,
         "valid_users": valid_users,
         "write_list": write_list,
-        "create_mask": request.form.get("create_mask", "0744"),
-        "directory_mask": request.form.get("directory_mask", "0755"),
-        "force_group": "smbusers",
+        "create_mask": create_mask,
+        "directory_mask": directory_mask,
+        "force_user": request.form.get("force_user", "").strip(),
+        "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
     }
 
@@ -307,7 +338,8 @@ def add_share():
     if result:
         flash("Share added successfully and Samba service restarted", "success")
     else:
-        flash("Failed to add share", "error")
+        detail = get_last_error()
+        flash(f"Failed to add share. {detail}" if detail else "Failed to add share", "error")
 
     return redirect("/shares")
 
@@ -347,27 +379,23 @@ def edit_share():
     else:
         print(f"Path validation successful: {message}")
 
-    # Process users and groups
-    valid_users = request.form.get("valid_users", "")
-    valid_groups = request.form.getlist("valid_groups")
+    valid_users = _build_principal_list(
+        request.form.get("valid_users", ""), request.form.getlist("valid_groups")
+    )
+    write_list = _build_principal_list(
+        request.form.get("write_list", ""), request.form.getlist("write_groups")
+    )
+    guest_ok = "yes" if request.form.get("guest_ok") else "no"
+    if guest_ok == "no" and not valid_users:
+        flash("For non-guest share, specify at least one valid user or group.", "error")
+        return redirect("/shares")
 
-    # Combine users and groups for valid_users field
-    if valid_groups:
-        if valid_users:
-            valid_users = valid_users + "," + ",".join(valid_groups)
-        else:
-            valid_users = ",".join(valid_groups)
-
-    # Process write list users and groups
-    write_list = request.form.get("write_list", "")
-    write_groups = request.form.getlist("write_groups")
-
-    # Combine users and groups for write_list field
-    if write_groups:
-        if write_list:
-            write_list = write_list + "," + ",".join(write_groups)
-        else:
-            write_list = ",".join(write_groups)
+    create_mask = request.form.get("create_mask", "").strip()
+    directory_mask = request.form.get("directory_mask", "").strip()
+    if not create_mask:
+        create_mask = "0664" if guest_ok == "no" else "0666"
+    if not directory_mask:
+        directory_mask = "0775" if guest_ok == "no" else "0777"
 
     # Update share with normalized key names
     share = {
@@ -376,12 +404,13 @@ def edit_share():
         "comment": request.form.get("comment", ""),
         "browseable": "yes" if request.form.get("browseable") else "no",
         "read_only": "yes" if request.form.get("read_only") else "no",
-        "guest_ok": "yes" if request.form.get("guest_ok") else "no",
+        "guest_ok": guest_ok,
         "valid_users": valid_users,
         "write_list": write_list,
-        "create_mask": request.form.get("create_mask", "0744"),
-        "directory_mask": request.form.get("directory_mask", "0755"),
-        "force_group": "smbusers",
+        "create_mask": create_mask,
+        "directory_mask": directory_mask,
+        "force_user": request.form.get("force_user", "").strip(),
+        "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
     }
 
@@ -393,7 +422,11 @@ def edit_share():
     if result:
         flash("Share updated successfully and Samba service restarted", "success")
     else:
-        flash("Failed to update share", "error")
+        detail = get_last_error()
+        flash(
+            f"Failed to update share. {detail}" if detail else "Failed to update share",
+            "error",
+        )
 
     return redirect("/shares")
 

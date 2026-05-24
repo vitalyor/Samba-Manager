@@ -33,7 +33,12 @@
         <tbody>
           {% for share in shares %}
           <tr>
-            <td class="align-middle">{{ share.name }}</td>
+            <td class="align-middle">
+              {{ share.name }}
+              {% if share.name in ['share', 'secure-share'] %}
+              <span class="badge bg-secondary ms-1">System share</span>
+              {% endif %}
+            </td>
             <td class="align-middle">{{ share.path }}</td>
             <td class="align-middle">
               {% if share.guest_ok == 'yes' %}
@@ -166,6 +171,16 @@
           <div class="mb-3">
             <label for="directory_mask{{ share.name }}" class="form-label">Directory Mask</label>
             <input type="text" class="form-control" id="directory_mask{{ share.name }}" name="directory_mask" value="{{ share.directory_mask }}">
+          </div>
+
+          <div class="mb-3">
+            <label for="force_user{{ share.name }}" class="form-label">Force User (optional)</label>
+            <input type="text" class="form-control" id="force_user{{ share.name }}" name="force_user" value="{{ share.force_user|default('') }}">
+          </div>
+
+          <div class="mb-3">
+            <label for="force_group{{ share.name }}" class="form-label">Force Group (optional)</label>
+            <input type="text" class="form-control" id="force_group{{ share.name }}" name="force_group" value="{{ share.force_group|default('') }}">
           </div>
           
           <div class="mb-3">
@@ -309,12 +324,22 @@
           
           <div class="mb-3">
             <label for="create_mask" class="form-label">Create Mask</label>
-            <input type="text" class="form-control" id="create_mask" name="create_mask" value="0744">
+            <input type="text" class="form-control" id="create_mask" name="create_mask" value="0664">
           </div>
           
           <div class="mb-3">
             <label for="directory_mask" class="form-label">Directory Mask</label>
-            <input type="text" class="form-control" id="directory_mask" name="directory_mask" value="0755">
+            <input type="text" class="form-control" id="directory_mask" name="directory_mask" value="0775">
+          </div>
+
+          <div class="mb-3">
+            <label for="force_user" class="form-label">Force User (optional)</label>
+            <input type="text" class="form-control" id="force_user" name="force_user">
+          </div>
+
+          <div class="mb-3">
+            <label for="force_group" class="form-label">Force Group (optional)</label>
+            <input type="text" class="form-control" id="force_group" name="force_group">
           </div>
           
           <div class="mb-3">

@@ -21,6 +21,17 @@ else:
     SHARE_CONF = "/etc/samba/shares.conf"
     ACTUAL_SMB_CONF = SMB_CONF
 
+LAST_ERROR = ""
+
+
+def set_last_error(message):
+    global LAST_ERROR
+    LAST_ERROR = message or ""
+
+
+def get_last_error():
+    return LAST_ERROR
+
 
 def parse_share_section(content):
     """Parse share sections from a Samba configuration file content"""
@@ -637,7 +648,7 @@ def parse_user_group_list(value):
     if not value:
         return [], []
 
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    items = [item.strip() for item in re.split(r"[\s,]+", value) if item.strip()]
     users = [item for item in items if not item.startswith("@")]
     groups = [item for item in items if item.startswith("@")]
 
@@ -645,7 +656,7 @@ def parse_user_group_list(value):
 
 
 def format_user_group_list(users, groups):
-    """Format users and groups into a single comma-separated string."""
+    """Format users and groups into a single space-separated string."""
     all_items = []
     if users:
         if isinstance(users, list):
@@ -659,7 +670,7 @@ def format_user_group_list(users, groups):
         else:
             all_items.append(groups)
 
-    return ",".join(all_items) if all_items else ""
+    return " ".join(all_items) if all_items else ""
 
 
 def load_shares():
@@ -695,6 +706,7 @@ def load_shares():
                     "write list": "write_list",
                     "create mask": "create_mask",
                     "directory mask": "directory_mask",
+                    "force user": "force_user",
                     "force group": "force_group",
                     "max connections": "max_connections",
                 }
@@ -713,9 +725,10 @@ def load_shares():
                     "guest_ok": "no",
                     "valid_users": "",
                     "write_list": "",
-                    "create_mask": "0775",
+                    "create_mask": "0664",
                     "directory_mask": "0775",
-                    "force_group": "smbusers",
+                    "force_user": "",
+                    "force_group": "",
                     "max_connections": "0",
                 }
 
@@ -772,6 +785,7 @@ def load_shares():
                         "write list": "write_list",
                         "create mask": "create_mask",
                         "directory mask": "directory_mask",
+                        "force user": "force_user",
                         "force group": "force_group",
                         "max connections": "max_connections",
                     }
@@ -810,6 +824,7 @@ def load_shares():
                         "write list": "write_list",
                         "create mask": "create_mask",
                         "directory mask": "directory_mask",
+                        "force user": "force_user",
                         "force group": "force_group",
                         "max connections": "max_connections",
                     }
@@ -828,9 +843,10 @@ def load_shares():
                         "guest_ok": "no",
                         "valid_users": "",
                         "write_list": "",
-                        "create_mask": "0775",
+                        "create_mask": "0664",
                         "directory_mask": "0775",
-                        "force_group": "smbusers",
+                        "force_user": "",
+                        "force_group": "",
                         "max_connections": "0",
                     }
 
@@ -915,6 +931,7 @@ def load_shares():
 
 def save_shares(shares):
     try:
+        set_last_error("")
         print(f"Saving {len(shares)} shares to {SHARE_CONF}")
 
         # Map our normalized keys back to Samba config keys
@@ -928,48 +945,54 @@ def save_shares(shares):
             "write_list": "write list",
             "create_mask": "create mask",
             "directory_mask": "directory mask",
+            "force_user": "force user",
             "force_group": "force group",
             "max_connections": "max connections",
         }
-
-        # These fields should always be included in the config, even if empty
-        required_fields = [
-            "path",
-            "valid_users",
-            "write_list",
-            "create_mask",
-            "directory_mask",
-        ]
+        allowed_fields = set(reverse_key_mapping.keys())
 
         # Create temporary file with new configuration
-        import tempfile
-
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
             temp_file.write("# Samba shares configuration\n\n")
             for s in shares:
                 temp_file.write(f"[{s['name']}]\n")
-
-                # First write required fields
-                for our_key in required_fields:
-                    if our_key in s:
-                        samba_key = reverse_key_mapping.get(our_key, our_key)
-                        temp_file.write(f"   {samba_key} = {s[our_key]}\n")
-
-                # Then write the rest of the fields
-                for our_key, value in s.items():
-                    if (
-                        our_key != "name" and our_key not in required_fields
-                    ):  # Skip the name and required fields
-                        if our_key in reverse_key_mapping:
-                            samba_key = reverse_key_mapping[our_key]
-                            temp_file.write(f"   {samba_key} = {value}\n")
-                        else:
-                            # For any keys not in our mapping, write them as-is
-                            temp_file.write(f"   {our_key} = {value}\n")
+                for our_key in reverse_key_mapping:
+                    value = str(s.get(our_key, "")).strip()
+                    if not value:
+                        continue
+                    samba_key = reverse_key_mapping[our_key]
+                    temp_file.write(f"   {samba_key} = {value}\n")
 
                 temp_file.write("\n")
             temp_path = temp_file.name
             print(f"Created temporary file at {temp_path}")
+
+        # Validate before replacing real shares.conf
+        testparm_cmd = ["testparm", "-s"]
+        if not DEV_MODE:
+            testparm_cmd = ["sudo", "testparm", "-s"]
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_smb:
+            include_path = temp_path
+            temp_smb.write("[global]\n")
+            temp_smb.write(f"   include = {include_path}\n\n")
+            temp_smb_path = temp_smb.name
+
+        testparm_exists = subprocess.run(
+            ["which", "testparm"], capture_output=True, text=True, check=False
+        )
+        if testparm_exists.returncode == 0:
+            validate_result = subprocess.run(
+                testparm_cmd + [temp_smb_path], capture_output=True, text=True, check=False
+            )
+            output = (validate_result.stdout or "") + "\n" + (validate_result.stderr or "")
+            if validate_result.returncode != 0 or "Unknown parameter encountered" in output:
+                os.unlink(temp_path)
+                os.unlink(temp_smb_path)
+                set_last_error(output.strip())
+                print(f"Share config validation failed: {output}")
+                return False
+        os.unlink(temp_smb_path)
 
         # Backup original shares file if it exists
         if os.path.exists(SHARE_CONF):
@@ -1001,6 +1024,7 @@ def save_shares(shares):
             print(f"Successfully copied configuration to {SHARE_CONF}")
         except Exception as e:
             print(f"Error copying shares file: {e}")
+            set_last_error(str(e))
             return False
 
         # Check if there are any shares defined directly in the main config
@@ -1175,7 +1199,8 @@ def save_shares(shares):
                 print(
                     f"Warning: Samba configuration validation failed: {validate_result.stderr}"
                 )
-                # Continue anyway as testparm might have warnings but still be valid
+                set_last_error(validate_result.stderr)
+                return False
         except Exception as e:
             print(f"Warning: Could not validate configuration: {e}")
 
@@ -1183,9 +1208,12 @@ def save_shares(shares):
         print("Restarting Samba service")
         result = restart_samba_service()
         print(f"Samba service restart {'successful' if result else 'failed'}")
+        if not result:
+            set_last_error("Configuration saved, but Samba reload/restart failed.")
         return result
     except Exception as e:
         print(f"Error saving shares: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1216,8 +1244,10 @@ def add_or_update_share(new_share):
             "guest_ok": "no",
             "valid_users": "",
             "write_list": "",
-            "create_mask": "0775",
+            "create_mask": "0664",
             "directory_mask": "0775",
+            "force_user": "",
+            "force_group": "",
             "max_connections": "0",
         }
 

@@ -494,19 +494,28 @@ def add_user():
         flash("Username and password are required", "error")
         return redirect("/users")
 
+    valid, message = validate_username(username)
+    if not valid:
+        flash(f"Invalid username: {message}", "error")
+        return redirect("/users")
+
     result = add_samba_user(username, password, create_system_user)
 
     if result:
         flash(f"User {username} added successfully", "success")
     else:
-        flash(f"Failed to add user {username}", "error")
+        detail = get_last_error()
+        flash(
+            f"Failed to add user {username}. {detail}" if detail else f"Failed to add user {username}",
+            "error",
+        )
 
     return redirect("/users")
 
 
 @bp.route("/users/reset-password/<username>", methods=["POST"])
 @login_required
-def reset_samba_password(username):
+def reset_samba_password_route(username):
     """Reset a Samba user's password"""
     if not check_sudo_access():
         flash("Error: Sudo access is required to reset passwords", "error")
@@ -523,26 +532,11 @@ def reset_samba_password(username):
         flash("Password is required", "error")
         return redirect("/users")
 
-    try:
-        # Use smbpasswd to reset the password
-        process = subprocess.Popen(
-            ["sudo", "smbpasswd", "-s", username],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Send the password twice (for confirmation)
-        stdout, stderr = process.communicate(input=f"{password}\n{password}\n")
-
-        if process.returncode != 0:
-            flash(f"Failed to reset password: {stderr}", "error")
-        else:
-            flash(f"Password for {username} reset successfully", "success")
-
-    except Exception as e:
-        flash(f"Error: {str(e)}", "error")
+    if reset_samba_password(username, password):
+        flash(f"Password for {username} reset successfully", "success")
+    else:
+        detail = get_last_error()
+        flash(f"Failed to reset password: {detail}" if detail else "Failed to reset password", "error")
 
     return redirect("/users")
 
@@ -660,19 +654,15 @@ def delete_samba_user(username):
         flash(f"User {username} is not a Samba user", "error")
         return redirect("/users")
 
+    delete_system_user = request.form.get("delete_system_user") == "on"
     try:
-        # Use smbpasswd to delete the user
-        result = subprocess.run(
-            ["sudo", "smbpasswd", "-x", username],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode != 0:
-            flash(f"Failed to delete user: {result.stderr}", "error")
+        result = remove_samba_user(username, delete_system_user=delete_system_user)
+        if not result:
+            detail = get_last_error()
+            flash(f"Failed to delete user: {detail}" if detail else "Failed to delete user", "error")
         else:
-            flash(f"User {username} deleted successfully", "success")
+            suffix = " (system user removed)" if delete_system_user else ""
+            flash(f"User {username} deleted successfully{suffix}", "success")
 
     except Exception as e:
         flash(f"Error: {str(e)}", "error")

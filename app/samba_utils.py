@@ -1745,6 +1745,17 @@ def add_samba_user(username, password, create_system_user=False):
         return True
 
     try:
+        set_last_error("")
+
+        def samba_user_exists(target_user):
+            probe = subprocess.run(
+                ["sudo", "pdbedit", "-L", "-u", target_user],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return probe.returncode == 0
+
         # Check if system user exists
         check_user = subprocess.run(
             ["id", username], capture_output=True, text=True, check=False
@@ -1754,14 +1765,26 @@ def add_samba_user(username, password, create_system_user=False):
         # Create system user if requested and doesn't exist
         if not user_exists and create_system_user:
             print(f"Creating system user: {username}")
+            create_cmd = ["sudo", "useradd", "-m", "-s", "/bin/bash"]
+            uid = os.environ.get("SAMBA_DEFAULT_UID", "").strip()
+            gid = os.environ.get("SAMBA_DEFAULT_GID", "").strip()
+            if uid.isdigit():
+                create_cmd.extend(["-u", uid])
+            if gid.isdigit():
+                create_cmd.extend(["-g", gid])
+            else:
+                create_cmd.append("-U")
+            create_cmd.append(username)
+
             create_user = subprocess.run(
-                ["sudo", "useradd", "-m", "-s", "/bin/bash", username],
+                create_cmd,
                 capture_output=True,
                 text=True,
                 check=False,
             )
             if create_user.returncode != 0:
                 print(f"Failed to create system user: {create_user.stderr}")
+                set_last_error(create_user.stderr.strip())
                 return False
 
             # Set system password
@@ -1775,7 +1798,14 @@ def add_samba_user(username, password, create_system_user=False):
             stdout, stderr = set_pass.communicate(input=f"{username}:{password}")
             if set_pass.returncode != 0:
                 print(f"Failed to set system password: {stderr}")
+                set_last_error(stderr.strip())
                 return False
+
+        if not user_exists:
+            set_last_error(
+                "System user does not exist. Enable 'Create system user' or create it manually."
+            )
+            return False
 
         # Create smbusers group if it doesn't exist
         check_group = subprocess.run(
@@ -1805,19 +1835,29 @@ def add_samba_user(username, password, create_system_user=False):
                 print(f"Failed to add user to smbusers group: {add_to_group.stderr}")
 
         # Add Samba user
-        print(f"Creating Samba user: {username}")
-        process = subprocess.Popen(
-            ["sudo", "smbpasswd", "-s", "-a", username],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        if samba_user_exists(username):
+            print(f"Samba user {username} exists, resetting password")
+            process = subprocess.Popen(
+                ["sudo", "smbpasswd", "-s", username],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        else:
+            print(f"Creating Samba user: {username}")
+            process = subprocess.Popen(
+                ["sudo", "smbpasswd", "-s", "-a", username],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
         stdout, stderr = process.communicate(input=f"{password}\n{password}\n")
-
         if process.returncode != 0:
-            print(f"Failed to create Samba user: {stderr}")
+            print(f"Failed to configure Samba user: {stderr}")
+            set_last_error(stderr.strip())
             return False
 
         # Enable the Samba user
@@ -1831,11 +1871,13 @@ def add_samba_user(username, password, create_system_user=False):
 
         if enable.returncode != 0:
             print(f"Failed to enable Samba user: {enable.stderr}")
+            set_last_error(enable.stderr.strip())
             return False
 
         return True
     except Exception as e:
         print(f"Error adding Samba user: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1846,16 +1888,24 @@ def remove_samba_user(username, delete_system_user=False):
         return True
 
     try:
+        set_last_error("")
         # Delete Samba user
-        success, _ = run_command(["sudo", "smbpasswd", "-x", username])
+        success, err = run_command(["sudo", "smbpasswd", "-x", username])
+        if not success:
+            set_last_error(err)
+            return False
 
         # Delete system user if requested
         if delete_system_user:
-            run_command(["sudo", "userdel", "-r", username])
+            sys_success, sys_err = run_command(["sudo", "userdel", "-r", username])
+            if not sys_success:
+                set_last_error(sys_err)
+                return False
 
         return success
     except Exception as e:
         print(f"Error removing Samba user: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1894,12 +1944,18 @@ def reset_samba_password(username, password):
         return True
 
     try:
-        success, _ = run_command(
+        success, err = run_command(
             ["sudo", "smbpasswd", "-s", username], f"{password}\n{password}\n"
         )
+        if not success:
+            set_last_error(err)
+            return False
+        # Keep user active after password reset
+        run_command(["sudo", "smbpasswd", "-e", username])
         return success
     except Exception as e:
         print(f"Error resetting Samba password: {e}")
+        set_last_error(str(e))
         return False
 
 

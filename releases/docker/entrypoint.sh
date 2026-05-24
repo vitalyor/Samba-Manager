@@ -9,21 +9,58 @@ export SAMBA_MANAGER_SECRET_KEY="${SAMBA_MANAGER_SECRET_KEY:-$(python3 -c 'impor
 export FLASK_ENV="${FLASK_ENV:-production}"
 
 # Required runtime directories for Samba
-mkdir -p /run/samba /var/lib/samba/private /var/cache/samba /var/log/samba /var/log/samba-manager /etc/samba/shares.d
+mkdir -p /etc/samba /run/samba /var/lib/samba /var/lib/samba/private /var/cache/samba /var/log/samba /var/log/samba-manager /etc/samba/shares.d /app
+chmod 0755 /var/lib/samba
 chmod 700 /var/lib/samba/private
 chmod 755 /etc/samba /etc/samba/shares.d /var/log/samba /var/log/samba-manager
 
-# Initialize Samba config if needed
-if [ ! -f /etc/samba/smb.conf ]; then
-    echo "Initializing /etc/samba/smb.conf from template..."
-    if [ -f /opt/samba-manager/smb.conf.template ]; then
-        cp /opt/samba-manager/smb.conf.template /etc/samba/smb.conf
-    else
-        echo "ERROR: smb.conf.template not found"
-        exit 1
+# Initialize UI users DB file
+USERS_FILE="${SAMBA_MANAGER_USERS_FILE:-/app/users.json}"
+if [ ! -f "$USERS_FILE" ] || [ ! -s "$USERS_FILE" ]; then
+    echo "{}" > "$USERS_FILE"
+else
+    if ! python3 - "$USERS_FILE" <<'PY'; then
+import json, pathlib, shutil, sys, datetime
+p = pathlib.Path(sys.argv[1])
+try:
+    json.loads(p.read_text() or "{}")
+except Exception:
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    backup = p.with_name(p.name + f".bak.{ts}")
+    shutil.copy2(p, backup)
+    p.write_text("{}")
+PY
+      echo "WARN: users.json was invalid, backed up and reset to {}"
     fi
 fi
+
+# Initialize Samba config if needed
+if [ ! -f /etc/samba/smb.conf ] || [ ! -s /etc/samba/smb.conf ]; then
+    cat > /etc/samba/smb.conf <<'EOF'
+[global]
+server string = Samba Server
+workgroup = WORKGROUP
+security = user
+map to guest = Bad User
+
+server min protocol = SMB2_02
+server max protocol = SMB3
+
+log file = /var/log/samba/log.%m
+max log size = 1000
+
+passdb backend = tdbsam
+
+include = /etc/samba/shares.conf
+EOF
+fi
 chmod 644 /etc/samba/smb.conf
+
+if [ ! -f /etc/samba/shares.conf ]; then
+    cat > /etc/samba/shares.conf <<'EOF'
+# Samba shares configuration
+EOF
+fi
 
 # Validate configuration before booting daemons
 echo "Validating Samba configuration with testparm..."

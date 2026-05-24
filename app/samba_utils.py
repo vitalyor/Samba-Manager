@@ -24,6 +24,21 @@ else:
 LAST_ERROR = ""
 
 
+def is_container_runtime():
+    return os.path.exists("/.dockerenv")
+
+
+def is_root_user():
+    return os.geteuid() == 0
+
+
+def with_privilege(cmd):
+    """Run command directly as root in container; fallback to sudo outside."""
+    if is_root_user() or DEV_MODE:
+        return cmd
+    return ["sudo"] + cmd
+
+
 def set_last_error(message):
     global LAST_ERROR
     LAST_ERROR = message or ""
@@ -129,7 +144,7 @@ def render_config_sections(sections, include_path=None):
 
 def testparm_has_warnings_or_service_section_error(output_text):
     lowered = (output_text or "").lower()
-    if "warning" in lowered:
+    if "unknown parameter encountered" in lowered:
         return True
     if "global parameter" in lowered and "service section" in lowered:
         return True
@@ -202,7 +217,7 @@ SHARE_DIRS = detect_share_directories()
 
 def check_sudo_access():
     """Check if the application has sudo access to manage Samba"""
-    if DEV_MODE:
+    if DEV_MODE or is_root_user():
         return True  # In development mode, we don't need sudo
     try:
         result = subprocess.run(["sudo", "-n", "true"], capture_output=True)
@@ -234,9 +249,19 @@ def run_command(cmd, input_str=None):
 def restart_samba_service():
     """Restart Samba service with proper error handling"""
     try:
+        # Container-friendly reload path first
+        reload_result = subprocess.run(
+            ["smbcontrol", "all", "reload-config"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if reload_result.returncode == 0:
+            return True
+
         # First try systemctl
         print("Attempting to restart Samba services with systemctl")
-        systemctl_cmd = ["sudo", "systemctl", "restart", "smbd.service", "nmbd.service"]
+        systemctl_cmd = with_privilege(["systemctl", "restart", "smbd.service", "nmbd.service"])
         result = subprocess.run(
             systemctl_cmd, capture_output=True, text=True, check=False
         )
@@ -247,8 +272,8 @@ def restart_samba_service():
 
         # If systemctl fails, try service command
         print("systemctl failed, trying service command")
-        service_cmd1 = ["sudo", "service", "smbd", "restart"]
-        service_cmd2 = ["sudo", "service", "nmbd", "restart"]
+        service_cmd1 = with_privilege(["service", "smbd", "restart"])
+        service_cmd2 = with_privilege(["service", "nmbd", "restart"])
 
         result1 = subprocess.run(
             service_cmd1, capture_output=True, text=True, check=False
@@ -263,8 +288,8 @@ def restart_samba_service():
 
         # If both methods fail, try init.d scripts
         print("service command failed, trying init.d scripts")
-        init_cmd1 = ["sudo", "/etc/init.d/smbd", "restart"]
-        init_cmd2 = ["sudo", "/etc/init.d/nmbd", "restart"]
+        init_cmd1 = with_privilege(["/etc/init.d/smbd", "restart"])
+        init_cmd2 = with_privilege(["/etc/init.d/nmbd", "restart"])
 
         result1 = subprocess.run(init_cmd1, capture_output=True, text=True, check=False)
         result2 = subprocess.run(init_cmd2, capture_output=True, text=True, check=False)
@@ -561,7 +586,7 @@ def write_global_settings(settings):
 
                 if sudo_check.returncode == 0:
                     system_result = subprocess.run(
-                        ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
+                        with_privilege(["cp", temp_path, "/etc/samba/smb.conf"]),
                         capture_output=True,
                         text=True,
                         check=False,
@@ -580,7 +605,7 @@ def write_global_settings(settings):
                             shares_temp_path = shares_temp.name
 
                         shares_result = subprocess.run(
-                            ["sudo", "cp", shares_temp_path, "/etc/samba/shares.conf"],
+                            with_privilege(["cp", shares_temp_path, "/etc/samba/shares.conf"]),
                             capture_output=True,
                             text=True,
                             check=False,
@@ -621,7 +646,7 @@ def write_global_settings(settings):
                 )
         else:
             system_result = subprocess.run(
-                ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
+                with_privilege(["cp", temp_path, "/etc/samba/smb.conf"]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -677,7 +702,7 @@ def write_global_settings(settings):
             )
             if testparm_check.returncode == 0:
                 validate_cmd = subprocess.run(
-                    ["sudo", "testparm", "-s", "/etc/samba/smb.conf"],
+                    with_privilege(["testparm", "-s", "/etc/samba/smb.conf"]),
                     capture_output=True,
                     text=True,
                     check=False,
@@ -690,7 +715,7 @@ def write_global_settings(settings):
                     validate_output
                 ):
                     subprocess.run(
-                        ["sudo", "cp", backup_path, "/etc/samba/smb.conf"], check=False
+                        with_privilege(["cp", backup_path, "/etc/samba/smb.conf"]), check=False
                     )
                     print(f"Invalid configuration: {validate_output}")
                     return False, f"Invalid Samba configuration: {validate_output.strip()}"
@@ -1045,9 +1070,7 @@ def save_shares(shares):
             print(f"Created temporary file at {temp_path}")
 
         # Validate before replacing real shares.conf
-        testparm_cmd = ["testparm", "-s"]
-        if not DEV_MODE:
-            testparm_cmd = ["sudo", "testparm", "-s"]
+        testparm_cmd = with_privilege(["testparm", "-s"])
 
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_smb:
             include_path = temp_path
@@ -1075,7 +1098,7 @@ def save_shares(shares):
         if os.path.exists(SHARE_CONF):
             try:
                 subprocess.run(
-                    ["sudo", "cp", SHARE_CONF, f"{SHARE_CONF}.bak"], check=True
+                    with_privilege(["cp", SHARE_CONF, f"{SHARE_CONF}.bak"]), check=True
                 )
                 print(f"Backed up {SHARE_CONF} to {SHARE_CONF}.bak")
             except Exception as e:
@@ -1084,9 +1107,9 @@ def save_shares(shares):
         # Use sudo to copy the temporary file to the correct location
         try:
             print(f"Copying temporary file to {SHARE_CONF}")
-            subprocess.run(["sudo", "cp", temp_path, SHARE_CONF], check=True)
+            subprocess.run(with_privilege(["cp", temp_path, SHARE_CONF]), check=True)
             # Set proper permissions
-            subprocess.run(["sudo", "chmod", "644", SHARE_CONF], check=True)
+            subprocess.run(with_privilege(["chmod", "644", SHARE_CONF]), check=True)
 
             # If in production mode, also update the local copy for reference
             if not DEV_MODE:
@@ -1113,7 +1136,7 @@ def save_shares(shares):
                 if not DEV_MODE:
                     system_conf = "/etc/samba/smb.conf"
                     result = subprocess.run(
-                        ["sudo", "cat", system_conf],
+                        with_privilege(["cat", system_conf]),
                         capture_output=True,
                         text=True,
                         check=True,
@@ -1163,13 +1186,13 @@ def save_shares(shares):
                         if not DEV_MODE:
                             system_conf = "/etc/samba/smb.conf"
                             subprocess.run(
-                                ["sudo", "cp", system_conf, f"{system_conf}.bak"],
+                                with_privilege(["cp", system_conf, f"{system_conf}.bak"]),
                                 check=True,
                             )
                             print(f"Backed up {system_conf} to {system_conf}.bak")
                         else:
                             subprocess.run(
-                                ["sudo", "cp", SMB_CONF, f"{SMB_CONF}.bak"], check=True
+                                with_privilege(["cp", SMB_CONF, f"{SMB_CONF}.bak"]), check=True
                             )
                             print(f"Backed up {SMB_CONF} to {SMB_CONF}.bak")
                     except Exception as e:
@@ -1179,7 +1202,7 @@ def save_shares(shares):
                     if not DEV_MODE:
                         system_conf = "/etc/samba/smb.conf"
                         subprocess.run(
-                            ["sudo", "cp", temp_path, system_conf], check=True
+                            with_privilege(["cp", temp_path, system_conf]), check=True
                         )
                         # Also update local copy
                         try:
@@ -1190,15 +1213,15 @@ def save_shares(shares):
                                 f"Warning: Could not update local copy of main config: {e}"
                             )
                     else:
-                        subprocess.run(["sudo", "cp", temp_path, SMB_CONF], check=True)
+                        subprocess.run(with_privilege(["cp", temp_path, SMB_CONF]), check=True)
 
                     # Set proper permissions
                     if not DEV_MODE:
                         subprocess.run(
-                            ["sudo", "chmod", "644", system_conf], check=True
+                            with_privilege(["chmod", "644", system_conf]), check=True
                         )
                     else:
-                        subprocess.run(["sudo", "chmod", "644", SMB_CONF], check=True)
+                        subprocess.run(with_privilege(["chmod", "644", SMB_CONF]), check=True)
 
                     os.unlink(temp_path)  # Remove the temp file
                     print(f"Successfully removed shares from main config")
@@ -1211,7 +1234,7 @@ def save_shares(shares):
             if not DEV_MODE:
                 system_conf = "/etc/samba/smb.conf"
                 result = subprocess.run(
-                    ["sudo", "cat", system_conf],
+                    with_privilege(["cat", system_conf]),
                     capture_output=True,
                     text=True,
                     check=True,
@@ -1238,7 +1261,7 @@ def save_shares(shares):
                 # Use sudo to copy the temporary file to the correct location
                 if not DEV_MODE:
                     system_conf = "/etc/samba/smb.conf"
-                    subprocess.run(["sudo", "cp", temp_path, system_conf], check=True)
+                    subprocess.run(with_privilege(["cp", temp_path, system_conf]), check=True)
                     # Also update local copy
                     try:
                         subprocess.run(["cp", temp_path, "./smb.conf"], check=True)
@@ -1250,13 +1273,13 @@ def save_shares(shares):
                             f"Warning: Could not update local copy of main config: {e}"
                         )
                 else:
-                    subprocess.run(["sudo", "cp", temp_path, SMB_CONF], check=True)
+                    subprocess.run(with_privilege(["cp", temp_path, SMB_CONF]), check=True)
 
                 # Set proper permissions
                 if not DEV_MODE:
-                    subprocess.run(["sudo", "chmod", "644", system_conf], check=True)
+                    subprocess.run(with_privilege(["chmod", "644", system_conf]), check=True)
                 else:
-                    subprocess.run(["sudo", "chmod", "644", SMB_CONF], check=True)
+                    subprocess.run(with_privilege(["chmod", "644", SMB_CONF]), check=True)
 
                 os.unlink(temp_path)  # Remove the temp file
                 print(f"Updated include directive placement in main config")
@@ -1265,7 +1288,7 @@ def save_shares(shares):
 
         # Validate configuration before restarting
         try:
-            validate_cmd = ["sudo", "testparm", "-s"]
+            validate_cmd = with_privilege(["testparm", "-s"])
             validate_result = subprocess.run(
                 validate_cmd, capture_output=True, text=True, check=False
             )
@@ -1281,13 +1304,19 @@ def save_shares(shares):
         except Exception as e:
             print(f"Warning: Could not validate configuration: {e}")
 
-        # Restart Samba service
-        print("Restarting Samba service")
-        result = restart_samba_service()
-        print(f"Samba service restart {'successful' if result else 'failed'}")
-        if not result:
-            set_last_error("Configuration saved, but Samba reload/restart failed.")
-        return result
+        # Reload Samba in-place; do not crash if reload fails.
+        reload_result = subprocess.run(
+            ["smbcontrol", "all", "reload-config"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if reload_result.returncode != 0:
+            set_last_error(
+                f"Configuration saved, but reload failed: {reload_result.stderr.strip()}"
+            )
+            return True
+        return True
     except Exception as e:
         print(f"Error saving shares: {e}")
         set_last_error(str(e))

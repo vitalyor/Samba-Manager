@@ -1,6 +1,7 @@
 import json
 import os
 import fcntl
+from datetime import datetime
 
 from flask import Blueprint, flash, redirect, render_template, request, session, url_for
 from flask_limiter import Limiter
@@ -16,13 +17,31 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 bp = Blueprint("auth", __name__)
 
-# Path to store user data
-USERS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "users.json")
+# Path to store user data (single persistent path in container/runtime)
+USERS_FILE = os.environ.get("SAMBA_MANAGER_USERS_FILE", "/app/users.json")
 
-# Ensure users file exists (but don't create default admin)
-if not os.path.exists(USERS_FILE):
-    with open(USERS_FILE, "w") as f:
-        json.dump({}, f)  # Start with empty users
+
+def _ensure_users_file():
+    os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
+    if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
+        with open(USERS_FILE, "w") as f:
+            json.dump({}, f)
+        return
+    try:
+        with open(USERS_FILE, "r") as f:
+            json.load(f)
+    except Exception:
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        backup = f"{USERS_FILE}.bak.{ts}"
+        try:
+            os.replace(USERS_FILE, backup)
+        except Exception:
+            pass
+        with open(USERS_FILE, "w") as f:
+            json.dump({}, f)
+
+
+_ensure_users_file()
 
 
 class User(UserMixin):
@@ -41,11 +60,15 @@ class User(UserMixin):
 
     @staticmethod
     def get_users():
+        _ensure_users_file()
         if os.path.exists(USERS_FILE):
             with open(USERS_FILE, "r") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
                 try:
                     return json.load(f)
+                except Exception:
+                    # Never crash auth flow on corrupt/empty JSON.
+                    return {}
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         return {}

@@ -1,47 +1,59 @@
 #!/bin/bash
 # Docker entrypoint for Samba Manager
 
-set -e
+set -euo pipefail
 
-echo "Starting Samba Manager..."
-echo "=========================="
-echo ""
+echo "Starting Samba Manager container..."
 
-# Environment variables
 export SAMBA_MANAGER_SECRET_KEY="${SAMBA_MANAGER_SECRET_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(32))')}"
 export FLASK_ENV="${FLASK_ENV:-production}"
 
-# Initialize Samba configuration if not present
+# Required runtime directories for Samba
+mkdir -p /run/samba /var/lib/samba/private /var/cache/samba /var/log/samba /var/log/samba-manager /etc/samba/shares.d
+chmod 700 /var/lib/samba/private
+chmod 755 /etc/samba /etc/samba/shares.d /var/log/samba /var/log/samba-manager
+
+# Initialize Samba config if needed
 if [ ! -f /etc/samba/smb.conf ]; then
-    echo "Initializing Samba configuration..."
+    echo "Initializing /etc/samba/smb.conf from template..."
     if [ -f /opt/samba-manager/smb.conf.template ]; then
         cp /opt/samba-manager/smb.conf.template /etc/samba/smb.conf
-        echo "✓ Samba configuration initialized from template"
+    else
+        echo "ERROR: smb.conf.template not found"
+        exit 1
     fi
 fi
+chmod 644 /etc/samba/smb.conf
 
-# Create shares.d directory if it doesn't exist
-mkdir -p /etc/samba/shares.d
-echo "✓ Samba shares directory ready"
+# Validate configuration before booting daemons
+echo "Validating Samba configuration with testparm..."
+if ! testparm -s /etc/samba/smb.conf >/tmp/testparm.out 2>/tmp/testparm.err; then
+    echo "ERROR: Invalid Samba configuration"
+    cat /tmp/testparm.out /tmp/testparm.err || true
+    exit 1
+fi
 
-# Set proper permissions
-chmod 755 /etc/samba
-chmod 644 /etc/samba/smb.conf 2>/dev/null || true
-chmod 755 /etc/samba/shares.d
+shutdown() {
+    echo "Stopping services..."
+    if [ -n "${FLASK_PID:-}" ] && kill -0 "$FLASK_PID" 2>/dev/null; then
+        kill "$FLASK_PID" 2>/dev/null || true
+    fi
+    pkill -TERM smbd 2>/dev/null || true
+    pkill -TERM nmbd 2>/dev/null || true
+    wait || true
+}
 
-# Create log directories if they don't exist
-mkdir -p /var/log/samba-manager
-mkdir -p /var/log/samba
-chmod 755 /var/log/samba-manager
-chmod 755 /var/log/samba
+trap shutdown TERM INT
 
-echo "✓ Directories initialized"
-echo "✓ Environment configured"
-echo ""
-echo "Starting services..."
-echo "- Samba Manager on port 5000"
-echo "- Samba daemon (smbd)"
-echo ""
+echo "Starting smbd..."
+/usr/sbin/smbd -D
+echo "Starting nmbd..."
+/usr/sbin/nmbd -D
 
-# Start the supervisord daemon
-exec "$@"
+echo "Starting Flask UI..."
+python /opt/samba-manager/run.py --host 0.0.0.0 --port "${FLASK_PORT:-5000}" &
+FLASK_PID=$!
+
+# Keep PID 1 alive and react to child exits/signals
+wait -n "$FLASK_PID"
+shutdown

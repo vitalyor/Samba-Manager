@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     samba-common \
     smbclient \
     sudo \
-    supervisor \
+    procps \
+    iproute2 \
     curl \
     wget \
     git \
@@ -36,16 +37,12 @@ RUN mkdir -p /var/log/samba-manager \
     && touch /var/log/samba-manager/access.log \
     && chmod 755 /var/log/samba-manager
 
-# Create supervisor configuration
-RUN mkdir -p /etc/supervisor/conf.d
-
-COPY releases/docker/supervisord.conf /etc/supervisor/conf.d/samba-manager.conf
 COPY releases/docker/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
 
 # Expose web port
-EXPOSE 5000
+EXPOSE 139 445 5000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
@@ -57,6 +54,4 @@ RUN useradd -m -s /bin/bash sambamanager || true
 # Volume mounts for persistent data
 VOLUME ["/etc/samba", "/var/log/samba-manager", "/var/log/samba"]
 
-# Entrypoint
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["supervisord", "-c", "/etc/supervisor/conf.d/samba-manager.conf"]

@@ -284,6 +284,38 @@ def get_samba_status():
     """Get the status of the Samba service"""
     if DEV_MODE:
         return {"smbd": "active (dev)", "nmbd": "active (dev)"}
+
+    # Container/runtime-first check: process presence and listening ports.
+    try:
+        smbd_proc = subprocess.run(
+            ["pgrep", "-x", "smbd"], capture_output=True, text=True, check=False
+        )
+        nmbd_proc = subprocess.run(
+            ["pgrep", "-x", "nmbd"], capture_output=True, text=True, check=False
+        )
+        if smbd_proc.returncode == 0 or nmbd_proc.returncode == 0:
+            return {
+                "smbd": "active" if smbd_proc.returncode == 0 else "inactive",
+                "nmbd": "active" if nmbd_proc.returncode == 0 else "inactive",
+            }
+    except Exception:
+        pass
+
+    try:
+        ss_result = subprocess.run(
+            ["ss", "-lnt"], capture_output=True, text=True, check=False
+        )
+        if ss_result.returncode == 0:
+            output = ss_result.stdout
+            smbd_active = ":139" in output or ":445" in output
+            # nmbd is UDP/137, but if Samba ports are open we treat stack as active fallback.
+            return {
+                "smbd": "active" if smbd_active else "inactive",
+                "nmbd": "active" if smbd_active else "inactive",
+            }
+    except Exception:
+        pass
+
     try:
         # Try systemctl first (for systemd systems)
         smbd = subprocess.run(

@@ -32,20 +32,33 @@ def validate_share_name(name):
     if not name:
         return False, "Share name cannot be empty"
 
-    if len(name) > 80:
+    candidate = name.strip()
+    if not candidate:
+        return False, "Share name cannot be empty"
+
+    if len(candidate) > 80:
         return False, "Share name too long (max 80 characters)"
 
-    # Samba share names can contain letters, numbers, underscores, hyphens
-    # Must not contain spaces or special characters that could cause issues
-    if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+    # Allow Unicode letters/numbers, spaces, underscores and hyphens.
+    # Block Samba separators and shell/smb-conf special symbols.
+    forbidden_chars = set('/\\[]:;|=,+*?<>@"\t\r\n')
+    if any(ch in forbidden_chars for ch in candidate):
         return (
             False,
-            "Share name can only contain letters, numbers, underscores, and hyphens",
+            "Share name contains forbidden characters. Allowed: letters (including Cyrillic), numbers, spaces, underscores, hyphens.",
         )
+    for ch in candidate:
+        if ch in {" ", "_", "-"}:
+            continue
+        if not ch.isalnum():
+            return (
+                False,
+                "Share name contains unsupported characters. Allowed: letters (including Cyrillic), numbers, spaces, underscores, hyphens.",
+            )
 
     # Reserved names
     reserved_names = ["global", "homes", "printers", "print$"]
-    if name.lower() in reserved_names:
+    if candidate.lower() in reserved_names:
         return False, "Share name is reserved by Samba"
 
     return True, "Valid"
@@ -244,6 +257,10 @@ def global_settings():
 @bp.route("/shares", methods=["GET", "POST"])
 @login_required
 def shares():
+    return _render_shares_page()
+
+
+def _render_shares_page(add_form_data=None, open_add_modal=False):
     has_sudo = check_sudo_access()
     all_shares = load_shares()
     hide_system_shares = os.environ.get("SAMBA_MANAGER_HIDE_SYSTEM_SHARES", "0") == "1"
@@ -259,6 +276,8 @@ def shares():
         users=list_system_users(),
         groups=list_system_groups(),
         has_sudo=has_sudo,
+        add_form_data=add_form_data or {},
+        open_add_modal=open_add_modal,
     )
 
 
@@ -270,20 +289,24 @@ def add_share():
         flash("Error: Sudo access is required to add shares", "error")
         return redirect("/shares")
 
-    name = request.form["name"]
+    form_data = request.form.to_dict(flat=True)
+    form_data["valid_groups"] = request.form.getlist("valid_groups")
+    form_data["write_groups"] = request.form.getlist("write_groups")
+
+    name = request.form["name"].strip()
     path = request.form["path"]
 
     # Validate share name
     valid_name, name_message = validate_share_name(name)
     if not valid_name:
         flash(f"Invalid share name: {name_message}", "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Check if share name already exists
     all_shares = load_shares()
     if any(s["name"] == name for s in all_shares):
         flash(f'A share with the name "{name}" already exists', "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Check if it's trying to override a system share
     if name in ["secure-share", "share"]:
@@ -291,13 +314,13 @@ def add_share():
             f'Cannot create system share "{name}". Edit /etc/samba/smb.conf directly.',
             "error",
         )
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Validate and create path if needed
     valid, message = validate_share_path(path)
     if not valid:
         flash(f"Invalid path: {message}", "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Process users/groups into Samba principal lists
     valid_users = _build_principal_list(
@@ -309,7 +332,7 @@ def add_share():
     guest_ok = "yes" if request.form.get("guest_ok") else "no"
     if guest_ok == "no" and not valid_users:
         flash("For non-guest share, specify at least one valid user or group.", "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     create_mask = request.form.get("create_mask", "").strip()
     directory_mask = request.form.get("directory_mask", "").strip()
@@ -345,6 +368,7 @@ def add_share():
     else:
         detail = get_last_error()
         flash(f"Failed to add share. {detail}" if detail else "Failed to add share", "error")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     return redirect("/shares")
 

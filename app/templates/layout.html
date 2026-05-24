@@ -352,15 +352,17 @@
     }
     
     .alert-danger {
-      background-color: rgba(239, 68, 68, 0.1);
-      border-color: rgba(239, 68, 68, 0.2);
-      color: #fca5a5;
+      background-color: #fee2e2;
+      border: 2px solid #ef4444;
+      color: #991b1b;
+      font-weight: 600;
     }
     
     .alert-warning {
-      background-color: rgba(245, 158, 11, 0.1);
-      border-color: rgba(245, 158, 11, 0.2);
-      color: #fcd34d;
+      background-color: #fef3c7;
+      border: 2px solid #f59e0b;
+      color: #92400e;
+      font-weight: 600;
     }
     
     /* Modals */
@@ -735,7 +737,17 @@
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         {% for category, message in messages %}
-          <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {% set bs_category = 'danger' if category == 'error' else category %}
+          <div class="alert alert-{{ bs_category }} alert-dismissible fade show" role="alert">
+            {% if bs_category == 'danger' %}
+            <i class="bi bi-exclamation-octagon-fill me-2"></i>
+            {% elif bs_category == 'warning' %}
+            <i class="bi bi-exclamation-triangle-fill me-2"></i>
+            {% elif bs_category == 'success' %}
+            <i class="bi bi-check-circle-fill me-2"></i>
+            {% else %}
+            <i class="bi bi-info-circle-fill me-2"></i>
+            {% endif %}
             {{ message }}
             <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
           </div>

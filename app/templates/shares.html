@@ -267,13 +267,13 @@
         <div class="modal-body">
           <div class="mb-3">
             <label for="name" class="form-label">Share Name</label>
-            <input type="text" class="form-control" id="name" name="name" required>
+            <input type="text" class="form-control" id="name" name="name" value="{{ add_form_data.get('name', '') }}" required>
           </div>
           
           <div class="mb-3">
             <label for="path" class="form-label">Path</label>
             <div class="input-group">
-              <input type="text" class="form-control" id="path" name="path" required>
+              <input type="text" class="form-control" id="path" name="path" value="{{ add_form_data.get('path', '') }}" required>
               <button type="button" class="btn btn-outline-secondary" id="browsePathBtn" title="Browse directories">
                 <i class="bi bi-folder2-open"></i>
               </button>
@@ -282,27 +282,27 @@
           
           <div class="mb-3">
             <label for="comment" class="form-label">Comment</label>
-            <input type="text" class="form-control" id="comment" name="comment">
+            <input type="text" class="form-control" id="comment" name="comment" value="{{ add_form_data.get('comment', '') }}">
           </div>
           
           <div class="row g-3 mb-3">
             <div class="col-md-4">
               <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="browseable" name="browseable" checked>
+                <input class="form-check-input" type="checkbox" id="browseable" name="browseable" {% if add_form_data.get('browseable', 'on') %}checked{% endif %}>
                 <label class="form-check-label" for="browseable">Browseable</label>
               </div>
             </div>
             
             <div class="col-md-4">
               <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="read_only" name="read_only">
+                <input class="form-check-input" type="checkbox" id="read_only" name="read_only" {% if add_form_data.get('read_only') %}checked{% endif %}>
                 <label class="form-check-label" for="read_only">Read Only</label>
               </div>
             </div>
             
             <div class="col-md-4">
               <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="guest_ok" name="guest_ok">
+                <input class="form-check-input" type="checkbox" id="guest_ok" name="guest_ok" {% if add_form_data.get('guest_ok') %}checked{% endif %}>
                 <label class="form-check-label" for="guest_ok">Guest OK</label>
               </div>
             </div>
@@ -310,7 +310,7 @@
           
           <div class="mb-3">
             <label for="valid_users" class="form-label">Valid Users</label>
-            <input type="text" class="form-control" id="valid_users" name="valid_users">
+            <input type="text" class="form-control" id="valid_users" name="valid_users" value="{{ add_form_data.get('valid_users', '') }}">
             <div class="form-text help-text">Comma-separated list of users</div>
           </div>
           
@@ -318,7 +318,7 @@
             <label for="valid_groups" class="form-label">Valid Groups</label>
             <select class="form-select" id="valid_groups" name="valid_groups" multiple size="3">
               {% for group in groups %}
-              <option value="@{{ group }}">{{ group }}</option>
+              <option value="@{{ group }}" {% if '@' + group in add_form_data.get('valid_groups', []) %}selected{% endif %}>{{ group }}</option>
               {% endfor %}
             </select>
             <div class="form-text help-text">Hold Ctrl to select multiple groups</div>
@@ -326,7 +326,7 @@
           
           <div class="mb-3">
             <label for="write_list" class="form-label">Write List</label>
-            <input type="text" class="form-control" id="write_list" name="write_list">
+            <input type="text" class="form-control" id="write_list" name="write_list" value="{{ add_form_data.get('write_list', '') }}">
             <div class="form-text help-text">Comma-separated list of users with write access</div>
           </div>
           
@@ -334,7 +334,7 @@
             <label for="write_groups" class="form-label">Write Groups</label>
             <select class="form-select" id="write_groups" name="write_groups" multiple size="3">
               {% for group in groups %}
-              <option value="@{{ group }}">{{ group }}</option>
+              <option value="@{{ group }}" {% if '@' + group in add_form_data.get('write_groups', []) %}selected{% endif %}>{{ group }}</option>
               {% endfor %}
             </select>
             <div class="form-text help-text">Hold Ctrl to select multiple groups</div>
@@ -342,36 +342,36 @@
           
           <div class="mb-3">
             <label for="create_mask" class="form-label">Create Mask</label>
-            <input type="text" class="form-control" id="create_mask" name="create_mask" value="0664">
+            <input type="text" class="form-control" id="create_mask" name="create_mask" value="{{ add_form_data.get('create_mask', '0664') }}">
           </div>
           
           <div class="mb-3">
             <label for="directory_mask" class="form-label">Directory Mask</label>
-            <input type="text" class="form-control" id="directory_mask" name="directory_mask" value="0775">
+            <input type="text" class="form-control" id="directory_mask" name="directory_mask" value="{{ add_form_data.get('directory_mask', '0775') }}">
           </div>
 
           <div class="mb-3">
             <label for="force_user" class="form-label">Force User (optional)</label>
-            <input type="text" class="form-control" id="force_user" name="force_user">
+            <input type="text" class="form-control" id="force_user" name="force_user" value="{{ add_form_data.get('force_user', '') }}">
           </div>
 
           <div class="mb-3">
             <label for="force_group" class="form-label">Force Group (optional)</label>
-            <input type="text" class="form-control" id="force_group" name="force_group">
+            <input type="text" class="form-control" id="force_group" name="force_group" value="{{ add_form_data.get('force_group', '') }}">
           </div>
 
           <div class="mb-3">
             <label for="access_mode" class="form-label">Access Mode</label>
             <select class="form-select" id="access_mode" name="access_mode">
-              <option value="auto" selected>Auto (recommended for external disks)</option>
-              <option value="manual">Manual (use Force User/Group exactly as entered)</option>
+              <option value="auto" {% if add_form_data.get('access_mode', 'auto') == 'auto' %}selected{% endif %}>Auto (recommended for external disks)</option>
+              <option value="manual" {% if add_form_data.get('access_mode') == 'manual' %}selected{% endif %}>Manual (use Force User/Group exactly as entered)</option>
             </select>
             <div class="form-text help-text">Auto never changes ownership on disk; it only sets Samba runtime mapping if needed.</div>
           </div>
           
           <div class="mb-3">
             <label for="max_connections" class="form-label">Max Connections</label>
-            <input type="number" class="form-control" id="max_connections" name="max_connections" value="0" min="0">
+            <input type="number" class="form-control" id="max_connections" name="max_connections" value="{{ add_form_data.get('max_connections', '0') }}" min="0">
             <div class="form-text help-text">Maximum number of connections (0 = unlimited)</div>
           </div>
         </div>
@@ -415,6 +415,7 @@
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
+  const shouldOpenAddModal = {{ 'true' if open_add_modal else 'false' }};
   const startPath = '/shares';
   let currentPath = startPath;
   let selectedPath = startPath;
@@ -429,8 +430,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const browserLoading = document.getElementById('browserLoading');
   const browserEmpty = document.getElementById('browserEmpty');
   const selectBtn = document.getElementById('selectDirectoryBtn');
+  let addShareModal = null;
 
-  if (!browseBtn || !browserModalEl) return;
+  if (addShareModalEl) {
+    addShareModal = new bootstrap.Modal(addShareModalEl);
+    if (shouldOpenAddModal) {
+      addShareModal.show();
+    }
+  }
+
+  if (!browseBtn || !browserModalEl || !addShareModalEl) return;
   const browserModal = new bootstrap.Modal(browserModalEl);
 
   function setLoading(state) {
@@ -501,7 +510,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   browseBtn.addEventListener('click', () => {
-    if (addShareModalEl) bootstrap.Modal.getInstance(addShareModalEl)?.hide();
+    bootstrap.Modal.getInstance(addShareModalEl)?.hide();
     currentPath = pathInput.value.trim() || startPath;
     selectedPath = currentPath;
     browserModal.show();
@@ -515,7 +524,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (parts.length) nameInput.value = parts[parts.length - 1];
     }
     browserModal.hide();
-    if (addShareModalEl) new bootstrap.Modal(addShareModalEl).show();
+    bootstrap.Modal.getOrCreateInstance(addShareModalEl).show();
   });
 
   browserModalEl.addEventListener('hidden.bs.modal', () => {

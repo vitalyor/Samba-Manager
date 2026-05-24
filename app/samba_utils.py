@@ -151,6 +151,68 @@ def testparm_has_warnings_or_service_section_error(output_text):
     return False
 
 
+def get_allowed_share_roots():
+    raw = os.environ.get("ALLOWED_SHARE_ROOTS", "/shares")
+    roots = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        roots.append(str(Path(value).resolve()))
+    return roots or ["/shares"]
+
+
+def _path_within_root(path_value, root_value):
+    path_obj = Path(path_value).resolve()
+    root_obj = Path(root_value).resolve()
+    return path_obj == root_obj or root_obj in path_obj.parents
+
+
+def browse_directories(path_value, allowed_roots=None):
+    if not path_value or not str(path_value).startswith("/"):
+        raise ValueError("Invalid path")
+
+    roots = allowed_roots or get_allowed_share_roots()
+    request_path = Path(path_value).resolve()
+
+    matching_root = None
+    for root in roots:
+        if _path_within_root(request_path, root):
+            matching_root = Path(root).resolve()
+            break
+    if matching_root is None:
+        raise PermissionError("Path is outside allowed roots")
+
+    if not request_path.exists():
+        raise FileNotFoundError("Path does not exist")
+    if not request_path.is_dir():
+        raise NotADirectoryError("Path is not a directory")
+
+    parent = None
+    if request_path != matching_root:
+        parent_candidate = request_path.parent.resolve()
+        if _path_within_root(parent_candidate, matching_root):
+            parent = str(parent_candidate)
+
+    directories = []
+    for entry in sorted(request_path.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            resolved = entry.resolve()
+        except Exception:
+            continue
+        if not _path_within_root(resolved, matching_root):
+            continue
+        if not resolved.is_dir():
+            continue
+        directories.append({"name": entry.name, "path": str(resolved)})
+
+    return {
+        "current_path": str(request_path),
+        "parent": parent,
+        "directories": directories,
+    }
+
+
 # Function to auto-detect share directories
 def detect_share_directories():
     """Auto-detect existing share directories on the system"""

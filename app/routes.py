@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+from urllib.parse import unquote
 
 from flask import (
     Blueprint,
@@ -1626,53 +1627,29 @@ def static_files(filename):
     return response
 
 
+@bp.route("/api/files/browse")
 @bp.route("/api/browse-directory")
 @login_required
 def browse_directory():
-    """API endpoint to browse server directories for share path selection"""
-    path = request.args.get('path', '/')
-    
-    # Security: prevent directory traversal attacks
-    if '..' in path or not path.startswith('/'):
-        return jsonify({"success": False, "error": "Invalid path"}), 400
-    
+    """Secure directory browser for share path selection."""
+    raw_path = request.args.get("path", "/shares")
+    path = unquote(raw_path).strip()
+    if not path:
+        path = "/shares"
+
     try:
-        # Check if path exists and is a directory
-        if not os.path.exists(path):
-            return jsonify({"success": False, "error": "Path does not exist"}), 404
-            
-        if not os.path.isdir(path):
-            return jsonify({"success": False, "error": "Path is not a directory"}), 400
-        
-        # Get directory contents
-        contents = []
-        try:
-            items = os.listdir(path)
-            for item in sorted(items):
-                item_path = os.path.join(path, item)
-                try:
-                    stat_info = os.stat(item_path)
-                    item_type = 'directory' if os.path.isdir(item_path) else 'file'
-                    contents.append({
-                        'name': item,
-                        'type': item_type,
-                        'size': stat_info.st_size if item_type == 'file' else 0,
-                        'modified': datetime.datetime.fromtimestamp(stat_info.st_mtime).isoformat()
-                    })
-                except (OSError, PermissionError):
-                    # Skip items we can't access
-                    continue
-        except (OSError, PermissionError):
-            return jsonify({"success": False, "error": "Permission denied"}), 403
-        
-        return jsonify({
-            "success": True,
-            "path": path,
-            "contents": contents
-        })
-        
+        result = browse_directories(path)
+        return jsonify(result)
+    except ValueError:
+        return jsonify({"error": "Invalid path"}), 400
+    except PermissionError:
+        return jsonify({"error": "Access denied for this path"}), 403
+    except FileNotFoundError:
+        return jsonify({"error": "Path does not exist"}), 404
+    except NotADirectoryError:
+        return jsonify({"error": "Path is not a directory"}), 400
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 @bp.route("/enable", methods=["GET"])

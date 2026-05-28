@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 # Use local configuration files for development
@@ -1543,30 +1544,103 @@ def add_or_update_share(new_share):
 def delete_share(name):
     """Delete a Samba share by name and restart the service"""
     try:
-        print(f"Deleting share: {name}")
+        target_name = unicodedata.normalize("NFC", (name or "").strip())
+        print(f"Deleting share: {target_name}")
+        if not target_name:
+            set_last_error("Share name is empty")
+            return False
+
         shares = load_shares()
         original_count = len(shares)
 
         # Filter out the share to delete
-        new_shares = [s for s in shares if s["name"] != name]
+        new_shares = []
+        for s in shares:
+            current_name = unicodedata.normalize("NFC", str(s.get("name", "")).strip())
+            if current_name != target_name:
+                new_shares.append(s)
 
         if len(new_shares) == original_count:
-            print(f"Warning: Share '{name}' not found in configuration")
+            print(f"Warning: Share '{target_name}' not found in loaded shares")
             return False
 
-        print(f"Removed share '{name}' from configuration")
+        print(f"Removed share '{target_name}' from in-memory configuration")
 
         # Save the updated shares and restart Samba
         result = save_shares(new_shares)
         if result:
-            print(f"Successfully deleted share '{name}' and restarted Samba")
+            print(f"Saved config after deleting share '{target_name}'")
         else:
-            print(f"Failed to save configuration after deleting share '{name}'")
+            print(f"Failed to save configuration after deleting share '{target_name}'")
+            return False
 
-        return result
+        # Post-check: verify share is really gone, otherwise force-remove its section.
+        remaining = [
+            s
+            for s in load_shares()
+            if unicodedata.normalize("NFC", str(s.get("name", "")).strip()) == target_name
+        ]
+        if remaining:
+            print(
+                f"Share '{target_name}' still present after save; forcing section removal from config files"
+            )
+            _force_remove_share_sections(target_name)
+
+            remaining_after_force = [
+                s
+                for s in load_shares()
+                if unicodedata.normalize("NFC", str(s.get("name", "")).strip()) == target_name
+            ]
+            if remaining_after_force:
+                set_last_error(
+                    f"Share '{target_name}' still present after forced cleanup"
+                )
+                return False
+
+        print(f"Successfully deleted share '{target_name}' and reloaded Samba")
+        return True
     except Exception as e:
         print(f"Error deleting share: {e}")
+        set_last_error(str(e))
         return False
+
+def _force_remove_share_sections(share_name):
+    """Force-remove share section from SHARE_CONF and SMB_CONF by section name."""
+    target_name = unicodedata.normalize("NFC", (share_name or "").strip())
+    if not target_name:
+        return
+
+    for conf_path in [SHARE_CONF, SMB_CONF]:
+        try:
+            if not os.path.exists(conf_path):
+                continue
+            with open(conf_path, "r") as f:
+                content = f.read()
+            sections = parse_config_content(content)
+            found = False
+            updated = {}
+            for sec_name, sec_data in sections.items():
+                if unicodedata.normalize("NFC", sec_name.strip()) == target_name:
+                    found = True
+                    continue
+                updated[sec_name] = sec_data
+            if not found:
+                continue
+
+            include_path = None
+            if "global" in updated:
+                include_path = updated["global"].get("include")
+            rendered = render_config_sections(updated, include_path=include_path)
+
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+                tmp.write(rendered)
+                tmp_path = tmp.name
+            subprocess.run(with_privilege(["cp", tmp_path, conf_path]), check=True)
+            subprocess.run(with_privilege(["chmod", "644", conf_path]), check=True)
+            os.unlink(tmp_path)
+            print(f"Forced section cleanup in {conf_path} for share '{target_name}'")
+        except Exception as e:
+            print(f"Warning: force cleanup failed for {conf_path}: {e}")
 
 
 def list_system_users():

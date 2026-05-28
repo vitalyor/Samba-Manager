@@ -486,7 +486,8 @@ def delete_share_route():
     if result:
         flash("Share deleted successfully and Samba service restarted", "success")
     else:
-        flash("Failed to delete share", "error")
+        detail = get_last_error()
+        flash(f"Failed to delete share. {detail}" if detail else "Failed to delete share", "error")
 
     # Force a page refresh to update the UI
     return redirect("/shares")

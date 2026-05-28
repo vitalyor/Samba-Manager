@@ -46,6 +46,9 @@ RECONCILE_INTERVAL_SECONDS = max(
 )
 RECONCILE_ENABLED = env_bool("SAMBA_MANAGER_DISK_RECONCILE_ENABLED", default=True)
 AUTO_CREATE_PROFILES = env_bool("SAMBA_MANAGER_SHARE_PROFILE_AUTOINIT", default=True)
+RECONNECT_RESET_SESSIONS = env_bool(
+    "SAMBA_MANAGER_DISK_RECONNECT_RESET_SESSIONS", default=True
+)
 
 LAST_ERROR = ""
 _PROFILE_LOCK = threading.RLock()
@@ -1153,8 +1156,15 @@ def reconcile_share_profiles_once():
         profiles = doc.get("shares", [])
         disks = discover_disks()
         effective_shares = []
+        reconnected_share_names = []
         for profile in profiles:
+            previous_state = str(profile.get("runtime_state") or "").strip().lower()
             share = _resolved_share_from_profile(profile, disks)
+            current_state = str(profile.get("runtime_state") or "").strip().lower()
+            if previous_state == "offline" and current_state == "online":
+                name = normalize_share_name(profile.get("name"))
+                if name:
+                    reconnected_share_names.append(name)
             if share:
                 effective_shares.append(share)
 
@@ -1171,6 +1181,9 @@ def reconcile_share_profiles_once():
         _save_profile_doc(doc)
 
         if new_content == old_content:
+            if RECONNECT_RESET_SESSIONS:
+                for share_name in reconnected_share_names:
+                    _reset_share_sessions_after_reconnect(share_name)
             return True
         if not _validate_shares_content(new_content):
             return False
@@ -1197,6 +1210,9 @@ def reconcile_share_profiles_once():
                 print(
                     "Warning: smbcontrol not found; shares.conf updated but live reload was skipped"
                 )
+            if RECONNECT_RESET_SESSIONS:
+                for share_name in reconnected_share_names:
+                    _reset_share_sessions_after_reconnect(share_name)
             return True
         except Exception as e:
             set_last_error(str(e))
@@ -1206,6 +1222,48 @@ def reconcile_share_profiles_once():
                 os.unlink(temp_path)
             except Exception:
                 pass
+
+
+def _reset_share_sessions_after_reconnect(share_name):
+    """Force clients to reopen a share after disk reconnect to avoid stale SMB state."""
+    share_name = normalize_share_name(share_name)
+    if not share_name:
+        return
+
+    try:
+        subprocess.run(
+            with_privilege(["smbcontrol", "smbd", "close-share", share_name]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        print(
+            f'Warning: smbcontrol not found; skipped session refresh for reconnected share "{share_name}"'
+        )
+        return
+    except Exception as e:
+        print(
+            f'Warning: failed to send close-share for reconnected share "{share_name}": {e}'
+        )
+
+    conn_state = get_active_connections()
+    connections = conn_state.get("connections", [])
+    target_connections = [c for c in connections if (c.get("service") or "") == share_name]
+
+    terminated = 0
+    for conn in target_connections:
+        pid = str(conn.get("pid") or "").strip()
+        if not pid:
+            continue
+        ok, _ = terminate_connection(pid)
+        if ok:
+            terminated += 1
+
+    if terminated:
+        print(
+            f'Closed {terminated} stale SMB session(s) for reconnected share "{share_name}"'
+        )
 
 
 def list_managed_shares():

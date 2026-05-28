@@ -86,6 +86,45 @@ class TestReconcileWaitingDisk(unittest.TestCase):
         self.assertEqual(ui_shares["ONLINE"]["runtime_state"], "online")
         self.assertEqual(ui_shares["OFFLINE"]["runtime_state"], "offline")
 
+    def test_offline_to_online_triggers_session_refresh(self):
+        doc = {
+            "version": 1,
+            "shares": [
+                {
+                    "name": "OFFLINE",
+                    "enabled": True,
+                    "mode": "path",
+                    "disk": {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+                    "relative_path": "/",
+                    "resolved_path": str(self.missing_path),
+                    "runtime_state": "unknown",
+                    "share": {
+                        "path": str(self.missing_path),
+                        "browseable": "yes",
+                        "read_only": "no",
+                        "guest_ok": "no",
+                        "valid_users": "vitalyor",
+                    },
+                }
+            ],
+        }
+        samba_utils._save_profile_doc(doc)
+
+        with patch.object(samba_utils, "_validate_shares_content", return_value=True):
+            first_ok = samba_utils.reconcile_share_profiles_once()
+        self.assertTrue(first_ok)
+
+        self.missing_path.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(samba_utils, "_validate_shares_content", return_value=True):
+            with patch.object(
+                samba_utils, "_reset_share_sessions_after_reconnect"
+            ) as reset_mock:
+                second_ok = samba_utils.reconcile_share_profiles_once()
+
+        self.assertTrue(second_ok)
+        reset_mock.assert_called_once_with("OFFLINE")
+
 
 if __name__ == "__main__":
     unittest.main()

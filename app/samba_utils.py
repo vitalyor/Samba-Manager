@@ -1082,9 +1082,14 @@ def _resolved_share_from_profile(profile, disks):
     # path mode
     fixed_path = (share_data.get("path") or profile.get("resolved_path") or "").strip()
     profile["resolved_path"] = fixed_path
-    profile["runtime_state"] = "online" if fixed_path and os.path.exists(fixed_path) else "offline"
+    path_exists = bool(fixed_path and os.path.exists(fixed_path))
+    profile["runtime_state"] = "online" if path_exists else "offline"
     share_data["path"] = fixed_path
-    return share_data if fixed_path else None
+    # Keep path-mode shares visible in UI as "Waiting Disk", but do not publish
+    # them in Samba while the backing path is missing.
+    if not path_exists:
+        return None
+    return share_data
 
 
 def _render_shares_conf_content(shares):
@@ -1176,12 +1181,22 @@ def reconcile_share_profiles_once():
         try:
             subprocess.run(with_privilege(["cp", temp_path, SHARE_CONF]), check=True)
             subprocess.run(with_privilege(["chmod", "644", SHARE_CONF]), check=True)
-            subprocess.run(
-                ["smbcontrol", "all", "reload-config"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                reload_result = subprocess.run(
+                    ["smbcontrol", "all", "reload-config"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if reload_result.returncode != 0:
+                    stderr = (reload_result.stderr or "").strip()
+                    print(
+                        f"Warning: smbcontrol reload-config failed after shares.conf update: {stderr or 'non-zero exit'}"
+                    )
+            except FileNotFoundError:
+                print(
+                    "Warning: smbcontrol not found; shares.conf updated but live reload was skipped"
+                )
             return True
         except Exception as e:
             set_last_error(str(e))

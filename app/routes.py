@@ -262,7 +262,7 @@ def shares():
 
 def _render_shares_page(add_form_data=None, open_add_modal=False):
     has_sudo = check_sudo_access()
-    all_shares = load_shares()
+    all_shares = list_managed_shares()
     hide_system_shares = os.environ.get("SAMBA_MANAGER_HIDE_SYSTEM_SHARES", "0") == "1"
 
     # Sort shares: system shares first, then local shares
@@ -275,6 +275,7 @@ def _render_shares_page(add_form_data=None, open_add_modal=False):
         shares=sorted_shares,
         users=list_system_users(),
         groups=list_system_groups(),
+        disks=discover_disks(),
         has_sudo=has_sudo,
         add_form_data=add_form_data or {},
         open_add_modal=open_add_modal,
@@ -295,6 +296,11 @@ def add_share():
 
     name = request.form["name"].strip()
     path = request.form["path"]
+    share_mode = request.form.get("share_mode", "path").strip().lower()
+    if share_mode not in {"path", "disk"}:
+        share_mode = "path"
+    disk_id = request.form.get("disk_id", "").strip()
+    relative_path = request.form.get("relative_path", "/").strip() or "/"
 
     # Validate share name
     valid_name, name_message = validate_share_name(name)
@@ -317,10 +323,11 @@ def add_share():
         return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Validate and create path if needed
-    valid, message = validate_share_path(path)
-    if not valid:
-        flash(f"Invalid path: {message}", "error")
-        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
+    if share_mode == "path":
+        valid, message = validate_share_path(path)
+        if not valid:
+            flash(f"Invalid path: {message}", "error")
+            return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Process users/groups into Samba principal lists
     valid_users = _build_principal_list(
@@ -357,6 +364,10 @@ def add_share():
         "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
         "access_mode": request.form.get("access_mode", "auto").strip().lower(),
+        "mode": share_mode,
+        "disk": {"disk_id": disk_id, "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": relative_path,
+        "enabled": True,
     }
     share, policy_note = apply_share_access_policy(share)
     if policy_note:
@@ -384,6 +395,11 @@ def edit_share():
     original_name = request.form["original_name"]
     name = request.form["name"]
     path = request.form["path"]
+    share_mode = request.form.get("share_mode", "path").strip().lower()
+    if share_mode not in {"path", "disk"}:
+        share_mode = "path"
+    disk_id = request.form.get("disk_id", "").strip()
+    relative_path = request.form.get("relative_path", "/").strip() or "/"
 
     # Check if it's a system share
     if original_name in ["secure-share", "share"]:
@@ -401,12 +417,13 @@ def edit_share():
             return redirect("/shares")
 
     # Validate and create path if needed
-    valid, message = validate_share_path(path)
-    if not valid:
-        flash(f"Invalid path: {message}", "error")
-        return redirect("/shares")
-    else:
-        print(f"Path validation successful: {message}")
+    if share_mode == "path":
+        valid, message = validate_share_path(path)
+        if not valid:
+            flash(f"Invalid path: {message}", "error")
+            return redirect("/shares")
+        else:
+            print(f"Path validation successful: {message}")
 
     valid_users = _build_principal_list(
         request.form.get("valid_users", ""), request.form.getlist("valid_groups")
@@ -442,6 +459,10 @@ def edit_share():
         "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
         "access_mode": request.form.get("access_mode", "auto").strip().lower(),
+        "mode": share_mode,
+        "disk": {"disk_id": disk_id, "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": relative_path,
+        "enabled": True,
     }
     share, policy_note = apply_share_access_policy(share)
     if policy_note:
@@ -518,6 +539,33 @@ def prepare_unplug_share_route():
 
     ok, message = prepare_share_for_unplug(share_name)
     flash(message, "success" if ok else "error")
+    return redirect("/shares")
+
+
+@bp.route("/shares/toggle-enabled", methods=["POST"])
+@login_required
+def toggle_share_enabled_route():
+    if not check_sudo_access():
+        flash("Error: Sudo access is required to enable/disable shares", "error")
+        return redirect("/shares")
+
+    share_name = request.form.get("name", "").strip()
+    enabled = request.form.get("enabled", "0") == "1"
+    if not share_name:
+        flash("Share name is required", "error")
+        return redirect("/shares")
+
+    if set_share_enabled(share_name, enabled):
+        state_text = "enabled" if enabled else "disabled"
+        flash(f'Share "{share_name}" {state_text}', "success")
+    else:
+        detail = get_last_error()
+        flash(
+            f'Failed to update share "{share_name}". {detail}'
+            if detail
+            else f'Failed to update share "{share_name}"',
+            "error",
+        )
     return redirect("/shares")
 
 
@@ -1421,7 +1469,7 @@ def help_page():
 @login_required
 def api_shares():
     """API endpoint for shares"""
-    all_shares = load_shares()
+    all_shares = list_managed_shares()
 
     # Convert to simpler JSON format
     shares_json = [
@@ -1433,6 +1481,9 @@ def api_shares():
             "guest_ok": share.get("guest_ok", "no") == "yes",
             "valid_users": share.get("valid_users", ""),
             "max_connections": share.get("max_connections", "0"),
+            "enabled": bool(share.get("enabled", True)),
+            "runtime_state": share.get("runtime_state", "unknown"),
+            "mode": share.get("mode", "path"),
         }
         for share in all_shares
     ]

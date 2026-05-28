@@ -6,6 +6,8 @@ from flask_limiter.util import get_remote_address
 from flask_login import LoginManager
 from flask_wtf.csrf import CSRFProtect
 
+from .samba_utils import start_disk_reconciler
+
 
 def create_app():
     app = Flask(__name__)
@@ -52,5 +54,9 @@ def create_app():
         from .auth import User
 
         return User.get(user_id)
+
+    # Start profile/disk reconciler in-process (single microservice inside container).
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "false":
+        start_disk_reconciler()
 
     return app

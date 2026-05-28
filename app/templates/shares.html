@@ -27,6 +27,7 @@
             <th>Guest OK</th>
             <th>Browseable</th>
             <th>Read Only</th>
+            <th>Status</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -62,11 +63,36 @@
               {% endif %}
             </td>
             <td class="align-middle">
+              {% if share.enabled %}
+                {% if share.runtime_state == 'online' %}
+                <span class="badge bg-success">Enabled</span>
+                {% elif share.runtime_state == 'offline' %}
+                <span class="badge bg-warning">Waiting Disk</span>
+                {% else %}
+                <span class="badge bg-info">Enabled</span>
+                {% endif %}
+              {% else %}
+              <span class="badge bg-secondary">Disabled</span>
+              {% endif %}
+            </td>
+            <td class="align-middle">
               <div class="btn-group">
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#editShareModal{{ share.name }}">
                   <i class="bi bi-pencil"></i>
                 </button>
                 {% if share.name not in ['share', 'secure-share'] %}
+                <form action="/shares/toggle-enabled" method="post" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                  <input type="hidden" name="name" value="{{ share.name }}">
+                  <input type="hidden" name="enabled" value="{% if share.enabled %}0{% else %}1{% endif %}">
+                  <button
+                    type="submit"
+                    class="btn btn-sm {% if share.enabled %}btn-outline-secondary{% else %}btn-outline-success{% endif %}"
+                    title="{% if share.enabled %}Disable share{% else %}Enable share{% endif %}"
+                  >
+                    <i class="bi {% if share.enabled %}bi-pause-circle{% else %}bi-play-circle{% endif %}"></i>
+                  </button>
+                </form>
                 <form action="/shares/prepare-unplug" method="post" class="d-inline">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                   <input type="hidden" name="name" value="{{ share.name }}">
@@ -130,6 +156,30 @@
                 <i class="bi bi-folder2-open"></i>
               </button>
             </div>
+          </div>
+
+          <div class="mb-3">
+            <label for="share_mode{{ share.name }}" class="form-label">Binding Mode</label>
+            <select class="form-select share-mode-select" id="share_mode{{ share.name }}" name="share_mode" data-share-key="{{ share.name }}">
+              <option value="path" {% if share.mode != 'disk' %}selected{% endif %}>Path (classic)</option>
+              <option value="disk" {% if share.mode == 'disk' %}selected{% endif %}>Disk ID (auto remap)</option>
+            </select>
+          </div>
+
+          <div class="mb-3 disk-binding-fields" data-share-key="{{ share.name }}">
+            <label for="disk_id{{ share.name }}" class="form-label">Disk ID</label>
+            <select class="form-select" id="disk_id{{ share.name }}" name="disk_id">
+              <option value="">Select detected disk</option>
+              {% for disk in disks %}
+              <option value="{{ disk.disk_id }}" {% if share.disk_id == disk.disk_id %}selected{% endif %}>{{ disk.label or disk.mountpoint }} ({{ disk.disk_id }})</option>
+              {% endfor %}
+            </select>
+            <div class="form-text help-text">Share tracks this disk and auto-updates path when mountpoint changes.</div>
+          </div>
+
+          <div class="mb-3 disk-binding-fields" data-share-key="{{ share.name }}">
+            <label for="relative_path{{ share.name }}" class="form-label">Relative Path On Disk</label>
+            <input type="text" class="form-control" id="relative_path{{ share.name }}" name="relative_path" value="{{ share.relative_path|default('/') }}">
           </div>
           
           <div class="mb-3">
@@ -275,6 +325,30 @@
                 <i class="bi bi-folder2-open"></i>
               </button>
             </div>
+          </div>
+
+          <div class="mb-3">
+            <label for="share_mode" class="form-label">Binding Mode</label>
+            <select class="form-select share-mode-select" id="share_mode" name="share_mode" data-share-key="new">
+              <option value="path" {% if add_form_data.get('share_mode', 'path') != 'disk' %}selected{% endif %}>Path (classic)</option>
+              <option value="disk" {% if add_form_data.get('share_mode') == 'disk' %}selected{% endif %}>Disk ID (auto remap)</option>
+            </select>
+          </div>
+
+          <div class="mb-3 disk-binding-fields" data-share-key="new">
+            <label for="disk_id" class="form-label">Disk ID</label>
+            <select class="form-select" id="disk_id" name="disk_id">
+              <option value="">Select detected disk</option>
+              {% for disk in disks %}
+              <option value="{{ disk.disk_id }}" {% if add_form_data.get('disk_id', '') == disk.disk_id %}selected{% endif %}>{{ disk.label or disk.mountpoint }} ({{ disk.disk_id }})</option>
+              {% endfor %}
+            </select>
+            <div class="form-text help-text">When disk reconnects under a new mountpoint, share path updates automatically.</div>
+          </div>
+
+          <div class="mb-3 disk-binding-fields" data-share-key="new">
+            <label for="relative_path" class="form-label">Relative Path On Disk</label>
+            <input type="text" class="form-control" id="relative_path" name="relative_path" value="{{ add_form_data.get('relative_path', '/') }}">
           </div>
           
           <div class="mb-3">
@@ -430,12 +504,27 @@ document.addEventListener('DOMContentLoaded', () => {
   const selectBtn = document.getElementById('selectDirectoryBtn');
   let addShareModal = null;
 
+  function updateBindingFieldVisibility() {
+    document.querySelectorAll('.share-mode-select').forEach((select) => {
+      const key = select.dataset.shareKey || 'new';
+      const isDiskMode = select.value === 'disk';
+      document.querySelectorAll(`.disk-binding-fields[data-share-key="${key}"]`).forEach((el) => {
+        el.classList.toggle('d-none', !isDiskMode);
+      });
+    });
+  }
+
   if (addShareModalEl) {
     addShareModal = new bootstrap.Modal(addShareModalEl);
     if (shouldOpenAddModal) {
       addShareModal.show();
     }
   }
+
+  document.querySelectorAll('.share-mode-select').forEach((select) => {
+    select.addEventListener('change', updateBindingFieldVisibility);
+  });
+  updateBindingFieldVisibility();
 
   if (!browseBtns.length || !browserModalEl || !addShareModalEl) return;
   const browserModal = new bootstrap.Modal(browserModalEl);

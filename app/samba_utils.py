@@ -1,10 +1,12 @@
 import grp
+import json
 import os
 import pwd
 import re
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -22,8 +24,20 @@ else:
     SMB_CONF = "/etc/samba/smb.conf"
     SHARE_CONF = "/etc/samba/shares.conf"
     ACTUAL_SMB_CONF = SMB_CONF
+    SHARE_PROFILE_CONF = "/etc/samba/share_profiles.json"
+
+if DEV_MODE:
+    SHARE_PROFILE_CONF = "./share_profiles.json"
+
+RECONCILE_INTERVAL_SECONDS = max(
+    1, int(os.environ.get("SAMBA_MANAGER_DISK_RECONCILE_INTERVAL", "5"))
+)
+RECONCILE_ENABLED = os.environ.get("SAMBA_MANAGER_DISK_RECONCILE_ENABLED", "1") == "1"
+AUTO_CREATE_PROFILES = os.environ.get("SAMBA_MANAGER_SHARE_PROFILE_AUTOINIT", "1") == "1"
 
 LAST_ERROR = ""
+_PROFILE_LOCK = threading.RLock()
+_RECONCILER_THREAD = None
 
 
 def is_container_runtime():
@@ -48,6 +62,169 @@ def set_last_error(message):
 
 def get_last_error():
     return LAST_ERROR
+
+
+def normalize_share_name(name):
+    return unicodedata.normalize("NFC", str(name or "").strip())
+
+
+def _default_profile_doc():
+    return {"version": 1, "shares": []}
+
+
+def _load_profile_doc():
+    if not os.path.exists(SHARE_PROFILE_CONF):
+        return _default_profile_doc()
+    try:
+        with open(SHARE_PROFILE_CONF, "r") as f:
+            raw = f.read().strip()
+        if not raw:
+            return _default_profile_doc()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return _default_profile_doc()
+        if "shares" not in data or not isinstance(data.get("shares"), list):
+            data["shares"] = []
+        if "version" not in data:
+            data["version"] = 1
+        return data
+    except Exception as e:
+        print(f"Warning: failed to read share profile store {SHARE_PROFILE_CONF}: {e}")
+        return _default_profile_doc()
+
+
+def _save_profile_doc(doc):
+    os.makedirs(os.path.dirname(SHARE_PROFILE_CONF) or ".", exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+        json.dump(doc, temp_file, indent=2, ensure_ascii=False)
+        temp_path = temp_file.name
+    subprocess.run(with_privilege(["cp", temp_path, SHARE_PROFILE_CONF]), check=True)
+    subprocess.run(with_privilege(["chmod", "644", SHARE_PROFILE_CONF]), check=True)
+    os.unlink(temp_path)
+
+
+def _share_to_profile(share):
+    return {
+        "name": normalize_share_name(share.get("name")),
+        "enabled": True,
+        "mode": "path",
+        "disk": {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": "/",
+        "resolved_path": share.get("path", ""),
+        "runtime_state": "online",
+        "share": {
+            "comment": share.get("comment", ""),
+            "browseable": share.get("browseable", "yes"),
+            "read_only": share.get("read_only", "no"),
+            "guest_ok": share.get("guest_ok", "no"),
+            "valid_users": share.get("valid_users", ""),
+            "write_list": share.get("write_list", ""),
+            "create_mask": share.get("create_mask", "0664"),
+            "directory_mask": share.get("directory_mask", "0775"),
+            "force_user": share.get("force_user", ""),
+            "force_group": share.get("force_group", ""),
+            "max_connections": share.get("max_connections", "0"),
+            "path": share.get("path", ""),
+        },
+    }
+
+
+def ensure_share_profiles_initialized():
+    if not AUTO_CREATE_PROFILES:
+        return
+    with _PROFILE_LOCK:
+        doc = _load_profile_doc()
+        if doc.get("shares"):
+            return
+        print("Initializing share profile registry from current Samba config")
+        current_shares = load_shares()
+        doc["shares"] = [_share_to_profile(s) for s in current_shares]
+        _save_profile_doc(doc)
+
+
+def _discover_disks_from_lsblk():
+    disks = []
+    try:
+        result = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,KNAME,TYPE,FSTYPE,UUID,PARTUUID,SERIAL,WWN,LABEL,MOUNTPOINT,SIZE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return disks
+        data = json.loads(result.stdout or "{}")
+
+        def walk(nodes):
+            for node in nodes or []:
+                mountpoint = (node.get("mountpoint") or "").strip()
+                if mountpoint:
+                    disks.append(
+                        {
+                            "disk_id": (
+                                (f"partuuid:{node.get('partuuid')}" if node.get("partuuid") else "")
+                                or (f"uuid:{node.get('uuid')}" if node.get("uuid") else "")
+                                or (f"serial:{node.get('serial')}" if node.get("serial") else "")
+                                or (f"wwn:{node.get('wwn')}" if node.get("wwn") else "")
+                                or f"mount:{mountpoint}"
+                            ),
+                            "mountpoint": mountpoint,
+                            "label": node.get("label") or "",
+                            "fstype": node.get("fstype") or "",
+                            "uuid": node.get("uuid") or "",
+                            "partuuid": node.get("partuuid") or "",
+                            "serial": node.get("serial") or "",
+                            "wwn": node.get("wwn") or "",
+                            "size": node.get("size") or "",
+                        }
+                    )
+                walk(node.get("children") or [])
+
+        walk(data.get("blockdevices") or [])
+    except Exception as e:
+        print(f"Warning: lsblk discovery failed: {e}")
+    return disks
+
+
+def discover_disks():
+    roots = [Path(r).resolve() for r in get_allowed_share_roots()]
+    disk_map = {}
+    for disk in _discover_disks_from_lsblk():
+        mp = disk.get("mountpoint")
+        if not mp:
+            continue
+        try:
+            resolved = str(Path(mp).resolve())
+        except Exception:
+            continue
+        if not any(resolved == str(root) or str(root) in Path(resolved).parents for root in roots):
+            continue
+        disk["mountpoint"] = resolved
+        disk_map[disk["disk_id"]] = disk
+
+    # Fallback: treat top-level directories under allowed roots as pseudo disks.
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            pseudo_id = f"path:{entry.name}"
+            disk_map.setdefault(
+                pseudo_id,
+                {
+                    "disk_id": pseudo_id,
+                    "mountpoint": str(entry.resolve()),
+                    "label": entry.name,
+                    "fstype": "",
+                    "uuid": "",
+                    "partuuid": "",
+                    "serial": "",
+                    "wwn": "",
+                    "size": "",
+                },
+            )
+    return list(disk_map.values())
 
 
 def parse_share_section(content):
@@ -839,6 +1016,287 @@ def format_user_group_list(users, groups):
     return " ".join(all_items) if all_items else ""
 
 
+def _resolve_profile_disk_mount(profile, disks):
+    disk_meta = profile.get("disk") or {}
+    disk_id = (disk_meta.get("disk_id") or "").strip()
+    partuuid = (disk_meta.get("partuuid") or "").strip()
+    uuid = (disk_meta.get("uuid") or "").strip()
+    serial = (disk_meta.get("serial") or "").strip()
+    wwn = (disk_meta.get("wwn") or "").strip()
+
+    for disk in disks:
+        if disk_id and disk.get("disk_id") == disk_id:
+            return disk
+        if partuuid and partuuid == disk.get("partuuid"):
+            return disk
+        if uuid and uuid == disk.get("uuid"):
+            return disk
+        if serial and serial == disk.get("serial"):
+            return disk
+        if wwn and wwn == disk.get("wwn"):
+            return disk
+    return None
+
+
+def _resolved_share_from_profile(profile, disks):
+    mode = (profile.get("mode") or "path").strip().lower()
+    enabled = bool(profile.get("enabled", True))
+    share_data = dict(profile.get("share") or {})
+    share_name = normalize_share_name(profile.get("name"))
+    share_data["name"] = share_name
+    profile["runtime_state"] = "disabled" if not enabled else "unknown"
+
+    if not enabled:
+        return None
+
+    if mode == "disk":
+        disk = _resolve_profile_disk_mount(profile, disks)
+        if not disk:
+            profile["runtime_state"] = "offline"
+            profile["resolved_path"] = ""
+            return None
+        relative_path = (profile.get("relative_path") or "/").strip()
+        try:
+            rel = relative_path.lstrip("/")
+            resolved_path = str(Path(disk["mountpoint"], rel).resolve())
+        except Exception:
+            profile["runtime_state"] = "error"
+            return None
+        profile["resolved_path"] = resolved_path
+        share_data["path"] = resolved_path
+        profile["runtime_state"] = "online"
+        return share_data
+
+    # path mode
+    fixed_path = (share_data.get("path") or profile.get("resolved_path") or "").strip()
+    profile["resolved_path"] = fixed_path
+    profile["runtime_state"] = "online" if fixed_path and os.path.exists(fixed_path) else "offline"
+    share_data["path"] = fixed_path
+    return share_data if fixed_path else None
+
+
+def _render_shares_conf_content(shares):
+    reverse_key_mapping = {
+        "path": "path",
+        "comment": "comment",
+        "browseable": "browseable",
+        "read_only": "read only",
+        "guest_ok": "guest ok",
+        "valid_users": "valid users",
+        "write_list": "write list",
+        "create_mask": "create mask",
+        "directory_mask": "directory mask",
+        "force_user": "force user",
+        "force_group": "force group",
+        "max_connections": "max connections",
+    }
+    lines = ["# Samba shares configuration", ""]
+    for s in shares:
+        lines.append(f"[{s['name']}]")
+        for our_key in reverse_key_mapping:
+            value = str(s.get(our_key, "")).strip()
+            if not value:
+                continue
+            lines.append(f"   {reverse_key_mapping[our_key]} = {value}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _validate_shares_content(content):
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_shares:
+        temp_shares.write(content)
+        temp_shares_path = temp_shares.name
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_smb:
+        temp_smb.write("[global]\n")
+        temp_smb.write(f"   include = {temp_shares_path}\n\n")
+        temp_smb_path = temp_smb.name
+    try:
+        validate_cmd = with_privilege(["testparm", "-s", temp_smb_path])
+        result = subprocess.run(validate_cmd, capture_output=True, text=True, check=False)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode != 0 or "Unknown parameter encountered" in output:
+            set_last_error(output.strip())
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(temp_shares_path)
+        except Exception:
+            pass
+        try:
+            os.unlink(temp_smb_path)
+        except Exception:
+            pass
+
+
+def reconcile_share_profiles_once():
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        disks = discover_disks()
+        effective_shares = []
+        for profile in profiles:
+            share = _resolved_share_from_profile(profile, disks)
+            if share:
+                effective_shares.append(share)
+
+        new_content = _render_shares_conf_content(effective_shares)
+        old_content = ""
+        if os.path.exists(SHARE_CONF):
+            try:
+                with open(SHARE_CONF, "r") as f:
+                    old_content = f.read()
+            except Exception:
+                old_content = ""
+
+        # Persist runtime profile state even if shares.conf does not change.
+        _save_profile_doc(doc)
+
+        if new_content == old_content:
+            return True
+        if not _validate_shares_content(new_content):
+            return False
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write(new_content)
+            temp_path = temp_file.name
+        try:
+            subprocess.run(with_privilege(["cp", temp_path, SHARE_CONF]), check=True)
+            subprocess.run(with_privilege(["chmod", "644", SHARE_CONF]), check=True)
+            subprocess.run(
+                ["smbcontrol", "all", "reload-config"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return True
+        except Exception as e:
+            set_last_error(str(e))
+            return False
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
+def list_managed_shares():
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        result = []
+        for profile in profiles:
+            share = dict(profile.get("share") or {})
+            share["name"] = normalize_share_name(profile.get("name"))
+            share["path"] = profile.get("resolved_path") or share.get("path", "")
+            share["enabled"] = bool(profile.get("enabled", True))
+            share["mode"] = (profile.get("mode") or "path").strip().lower()
+            share["disk_id"] = (profile.get("disk") or {}).get("disk_id", "")
+            share["relative_path"] = profile.get("relative_path", "/")
+            share["runtime_state"] = profile.get("runtime_state", "unknown")
+            share.setdefault("comment", "")
+            share.setdefault("browseable", "yes")
+            share.setdefault("read_only", "no")
+            share.setdefault("guest_ok", "no")
+            share.setdefault("valid_users", "")
+            share.setdefault("write_list", "")
+            share.setdefault("create_mask", "0664")
+            share.setdefault("directory_mask", "0775")
+            share.setdefault("force_user", "")
+            share.setdefault("force_group", "")
+            share.setdefault("max_connections", "0")
+            result.append(share)
+        return result
+
+
+def upsert_share_profile(share, mode="path", enabled=True, disk=None, relative_path="/"):
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        target_name = normalize_share_name(share.get("name"))
+        normalized_share = dict(share)
+        normalized_share["name"] = target_name
+        profile = None
+        for item in profiles:
+            if normalize_share_name(item.get("name")) == target_name:
+                profile = item
+                break
+        if profile is None:
+            profile = {
+                "name": target_name,
+                "enabled": enabled,
+                "mode": mode,
+                "disk": disk or {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+                "relative_path": relative_path or "/",
+                "resolved_path": normalized_share.get("path", ""),
+                "runtime_state": "unknown",
+                "share": normalized_share,
+            }
+            profiles.append(profile)
+        else:
+            profile["enabled"] = enabled
+            profile["mode"] = mode
+            profile["disk"] = disk or profile.get("disk") or {
+                "disk_id": "",
+                "partuuid": "",
+                "uuid": "",
+                "serial": "",
+                "wwn": "",
+            }
+            profile["relative_path"] = relative_path or profile.get("relative_path") or "/"
+            profile["share"] = normalized_share
+            profile["resolved_path"] = normalized_share.get("path", profile.get("resolved_path", ""))
+        _save_profile_doc(doc)
+    return reconcile_share_profiles_once()
+
+
+def set_share_enabled(name, enabled):
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        target_name = normalize_share_name(name)
+        changed = False
+        for profile in doc.get("shares", []):
+            if normalize_share_name(profile.get("name")) == target_name:
+                profile["enabled"] = bool(enabled)
+                changed = True
+                break
+        if not changed:
+            set_last_error(f'Share "{name}" not found in profile registry')
+            return False
+        _save_profile_doc(doc)
+    return reconcile_share_profiles_once()
+
+
+def _disk_reconciler_loop():
+    print(
+        f"Disk reconciler started (enabled={RECONCILE_ENABLED}, interval={RECONCILE_INTERVAL_SECONDS}s)"
+    )
+    while True:
+        try:
+            reconcile_share_profiles_once()
+        except Exception as e:
+            print(f"Disk reconciler error: {e}")
+        time.sleep(RECONCILE_INTERVAL_SECONDS)
+
+
+def start_disk_reconciler():
+    global _RECONCILER_THREAD
+    if not RECONCILE_ENABLED:
+        print("Disk reconciler disabled by SAMBA_MANAGER_DISK_RECONCILE_ENABLED=0")
+        return
+    if _RECONCILER_THREAD and _RECONCILER_THREAD.is_alive():
+        return
+    ensure_share_profiles_initialized()
+    _RECONCILER_THREAD = threading.Thread(
+        target=_disk_reconciler_loop, name="disk-reconciler", daemon=True
+    )
+    _RECONCILER_THREAD.start()
+
+
 def _extract_plain_users(principal_string):
     items = [item.strip() for item in re.split(r"[\s,]+", principal_string or "") if item.strip()]
     return [item for item in items if not item.startswith("@")]
@@ -1506,30 +1964,24 @@ def add_or_update_share(new_share):
                 print(f"Using default value for {key}: {value}")
 
         print(f"Processing share with path: {new_share['path']}")
+        share_mode = (new_share.get("mode") or "path").strip().lower()
 
-        # Ensure the share directory exists with proper permissions
-        if not create_share_directory(new_share["name"], new_share["path"]):
-            print(
-                f"Failed to create or set permissions on share directory: {new_share['path']}"
-            )
-            return False
+        # Ensure the share directory exists with proper permissions for classic path mode.
+        if share_mode == "path":
+            if not create_share_directory(new_share["name"], new_share["path"]):
+                print(
+                    f"Failed to create or set permissions on share directory: {new_share['path']}"
+                )
+                return False
 
-        # Load existing shares
-        shares = load_shares()
-
-        # Check if we're updating an existing share
-        for idx, s in enumerate(shares):
-            if s["name"] == new_share["name"]:
-                print(f"Updating existing share: {new_share['name']}")
-                shares[idx] = new_share
-                break
-        else:
-            # Share doesn't exist, add it
-            print(f"Adding new share: {new_share['name']}")
-            shares.append(new_share)
-
-        # Save the updated shares
-        result = save_shares(shares)
+        # Profile-backed persistence + reconcile
+        result = upsert_share_profile(
+            share=new_share,
+            mode=(new_share.get("mode") or "path"),
+            enabled=bool(new_share.get("enabled", True)),
+            disk=new_share.get("disk"),
+            relative_path=new_share.get("relative_path", "/"),
+        )
         if result:
             print(f"Successfully saved share: {new_share['name']}")
         else:
@@ -1550,28 +2002,24 @@ def delete_share(name):
             set_last_error("Share name is empty")
             return False
 
-        shares = load_shares()
-        original_count = len(shares)
+        with _PROFILE_LOCK:
+            ensure_share_profiles_initialized()
+            doc = _load_profile_doc()
+            profiles = doc.get("shares", [])
+            kept = []
+            removed = False
+            for profile in profiles:
+                if normalize_share_name(profile.get("name")) == target_name:
+                    removed = True
+                    continue
+                kept.append(profile)
+            if not removed:
+                print(f"Warning: Share '{target_name}' not found in profile registry")
+                return False
+            doc["shares"] = kept
+            _save_profile_doc(doc)
 
-        # Filter out the share to delete
-        new_shares = []
-        for s in shares:
-            current_name = unicodedata.normalize("NFC", str(s.get("name", "")).strip())
-            if current_name != target_name:
-                new_shares.append(s)
-
-        if len(new_shares) == original_count:
-            print(f"Warning: Share '{target_name}' not found in loaded shares")
-            return False
-
-        print(f"Removed share '{target_name}' from in-memory configuration")
-
-        # Save the updated shares and restart Samba
-        result = save_shares(new_shares)
-        if result:
-            print(f"Saved config after deleting share '{target_name}'")
-        else:
-            print(f"Failed to save configuration after deleting share '{target_name}'")
+        if not reconcile_share_profiles_once():
             return False
 
         # Post-check: verify share is really gone, otherwise force-remove its section.

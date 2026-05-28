@@ -29,11 +29,23 @@ else:
 if DEV_MODE:
     SHARE_PROFILE_CONF = "./share_profiles.json"
 
+
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
 RECONCILE_INTERVAL_SECONDS = max(
     1, int(os.environ.get("SAMBA_MANAGER_DISK_RECONCILE_INTERVAL", "5"))
 )
-RECONCILE_ENABLED = os.environ.get("SAMBA_MANAGER_DISK_RECONCILE_ENABLED", "1") == "1"
-AUTO_CREATE_PROFILES = os.environ.get("SAMBA_MANAGER_SHARE_PROFILE_AUTOINIT", "1") == "1"
+RECONCILE_ENABLED = env_bool("SAMBA_MANAGER_DISK_RECONCILE_ENABLED", default=True)
+AUTO_CREATE_PROFILES = env_bool("SAMBA_MANAGER_SHARE_PROFILE_AUTOINIT", default=True)
 
 LAST_ERROR = ""
 _PROFILE_LOCK = threading.RLock()

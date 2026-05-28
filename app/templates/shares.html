@@ -118,7 +118,18 @@
           
           <div class="mb-3">
             <label for="path{{ share.name }}" class="form-label">Path</label>
-            <input type="text" class="form-control" id="path{{ share.name }}" name="path" value="{{ share.path }}" required>
+            <div class="input-group">
+              <input type="text" class="form-control" id="path{{ share.name }}" name="path" value="{{ share.path }}" required>
+              <button
+                type="button"
+                class="btn btn-outline-secondary browse-path-btn"
+                data-modal-id="editShareModal{{ share.name }}"
+                data-path-input-id="path{{ share.name }}"
+                title="Browse directories"
+              >
+                <i class="bi bi-folder2-open"></i>
+              </button>
+            </div>
           </div>
           
           <div class="mb-3">
@@ -260,7 +271,7 @@
             <label for="path" class="form-label">Path</label>
             <div class="input-group">
               <input type="text" class="form-control" id="path" name="path" value="{{ add_form_data.get('path', '') }}" required>
-              <button type="button" class="btn btn-outline-secondary" id="browsePathBtn" title="Browse directories">
+              <button type="button" class="btn btn-outline-secondary browse-path-btn" id="browsePathBtn" data-modal-id="addShareModal" data-path-input-id="path" data-name-input-id="name" title="Browse directories">
                 <i class="bi bi-folder2-open"></i>
               </button>
             </div>
@@ -405,11 +416,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const startPath = '/shares';
   let currentPath = startPath;
   let selectedPath = startPath;
+  let currentSourceModalId = 'addShareModal';
+  let currentTargetPathInputId = 'path';
+  let currentTargetNameInputId = 'name';
   const addShareModalEl = document.getElementById('addShareModal');
   const browserModalEl = document.getElementById('directoryBrowserModal');
-  const browseBtn = document.getElementById('browsePathBtn');
-  const pathInput = document.getElementById('path');
-  const nameInput = document.getElementById('name');
+  const browseBtns = document.querySelectorAll('.browse-path-btn');
   const currentPathInput = document.getElementById('currentPath');
   const directoryContents = document.getElementById('directoryContents');
   const browserError = document.getElementById('browserError');
@@ -425,7 +437,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  if (!browseBtn || !browserModalEl || !addShareModalEl) return;
+  if (!browseBtns.length || !browserModalEl || !addShareModalEl) return;
   const browserModal = new bootstrap.Modal(browserModalEl);
 
   function setLoading(state) {
@@ -495,27 +507,51 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  browseBtn.addEventListener('click', () => {
-    bootstrap.Modal.getInstance(addShareModalEl)?.hide();
-    currentPath = pathInput.value.trim() || startPath;
-    selectedPath = currentPath;
-    browserModal.show();
-    loadDirectory(currentPath);
+  browseBtns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const modalId = btn.dataset.modalId || 'addShareModal';
+      const pathInputId = btn.dataset.pathInputId || 'path';
+      const nameInputId = btn.dataset.nameInputId || '';
+      const sourceModalEl = document.getElementById(modalId);
+      const sourcePathInput = document.getElementById(pathInputId);
+
+      currentSourceModalId = modalId;
+      currentTargetPathInputId = pathInputId;
+      currentTargetNameInputId = nameInputId;
+
+      if (sourceModalEl) {
+        bootstrap.Modal.getInstance(sourceModalEl)?.hide();
+      }
+      currentPath = sourcePathInput?.value?.trim() || startPath;
+      selectedPath = currentPath;
+      browserModal.show();
+      loadDirectory(currentPath);
+    });
   });
 
   selectBtn.addEventListener('click', () => {
-    pathInput.value = selectedPath;
-    if (!nameInput.value.trim()) {
+    const pathInput = document.getElementById(currentTargetPathInputId);
+    const nameInput = currentTargetNameInputId ? document.getElementById(currentTargetNameInputId) : null;
+    if (pathInput) {
+      pathInput.value = selectedPath;
+    }
+    if (nameInput && !nameInput.value.trim()) {
       const parts = selectedPath.split('/').filter(Boolean);
-      if (parts.length) nameInput.value = parts[parts.length - 1];
+      if (parts.length) {
+        nameInput.value = parts[parts.length - 1];
+      }
     }
     browserModal.hide();
-    bootstrap.Modal.getOrCreateInstance(addShareModalEl).show();
+    const sourceModalEl = document.getElementById(currentSourceModalId);
+    if (sourceModalEl) {
+      bootstrap.Modal.getOrCreateInstance(sourceModalEl).show();
+    }
   });
 
   browserModalEl.addEventListener('hidden.bs.modal', () => {
-    if (addShareModalEl && !addShareModalEl.classList.contains('show')) {
-      new bootstrap.Modal(addShareModalEl).show();
+    const sourceModalEl = document.getElementById(currentSourceModalId);
+    if (sourceModalEl && !sourceModalEl.classList.contains('show')) {
+      bootstrap.Modal.getOrCreateInstance(sourceModalEl).show();
     }
   });
 });

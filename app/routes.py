@@ -472,7 +472,7 @@ def delete_share_route():
         flash("Error: Sudo access is required to delete shares", "error")
         return redirect("/shares")
 
-    share_name = request.form["name"]
+    share_name = request.form["name"].strip()
 
     # Check if it's a system share
     if share_name in ["secure-share", "share"]:
@@ -483,11 +483,17 @@ def delete_share_route():
         return redirect("/shares")
 
     result = delete_share(share_name)
-    if result:
-        flash("Share deleted successfully and Samba service restarted", "success")
+    remaining_names = {s.get("name", "").strip() for s in load_shares()}
+    if result and share_name not in remaining_names:
+        flash(f'Share "{share_name}" deleted successfully and Samba service restarted', "success")
     else:
         detail = get_last_error()
-        flash(f"Failed to delete share. {detail}" if detail else "Failed to delete share", "error")
+        if share_name in remaining_names and not detail:
+            detail = "Share still present after save/reload. Check mounted /etc/samba volume consistency."
+        flash(
+            f'Failed to delete share "{share_name}". {detail}' if detail else f'Failed to delete share "{share_name}"',
+            "error",
+        )
 
     # Force a page refresh to update the UI
     return redirect("/shares")

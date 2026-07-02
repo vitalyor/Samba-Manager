@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+from urllib.parse import unquote
 
 from flask import (
     Blueprint,
@@ -31,20 +32,33 @@ def validate_share_name(name):
     if not name:
         return False, "Share name cannot be empty"
 
-    if len(name) > 80:
+    candidate = name.strip()
+    if not candidate:
+        return False, "Share name cannot be empty"
+
+    if len(candidate) > 80:
         return False, "Share name too long (max 80 characters)"
 
-    # Samba share names can contain letters, numbers, underscores, hyphens
-    # Must not contain spaces or special characters that could cause issues
-    if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+    # Allow Unicode letters/numbers, spaces, underscores and hyphens.
+    # Block Samba separators and shell/smb-conf special symbols.
+    forbidden_chars = set('/\\[]:;|=,+*?<>@"\t\r\n')
+    if any(ch in forbidden_chars for ch in candidate):
         return (
             False,
-            "Share name can only contain letters, numbers, underscores, and hyphens",
+            "Share name contains forbidden characters. Allowed: letters (including Cyrillic), numbers, spaces, underscores, hyphens.",
         )
+    for ch in candidate:
+        if ch in {" ", "_", "-"}:
+            continue
+        if not ch.isalnum():
+            return (
+                False,
+                "Share name contains unsupported characters. Allowed: letters (including Cyrillic), numbers, spaces, underscores, hyphens.",
+            )
 
     # Reserved names
     reserved_names = ["global", "homes", "printers", "print$"]
-    if name.lower() in reserved_names:
+    if candidate.lower() in reserved_names:
         return False, "Share name is reserved by Samba"
 
     return True, "Valid"
@@ -87,6 +101,15 @@ def validate_share_path(path):
     if ".." in abs_path or not abs_path.startswith("/"):
         return False, "Invalid path - directory traversal not allowed"
 
+    # Docker/CasaOS UX hint: users often provide host path inside container
+    if abs_path.startswith("/media/devmon/") and not os.path.exists(abs_path):
+        suggested = abs_path.replace("/media/devmon/", "/shares/", 1)
+        if os.path.exists("/shares") and os.path.exists(suggested):
+            return (
+                False,
+                f'Path "{abs_path}" not found in container. Try container path "{suggested}"',
+            )
+
     # Check if path exists and is a directory
     if not os.path.exists(abs_path):
         return False, "Path does not exist"
@@ -114,6 +137,29 @@ def validate_share_path(path):
             return False, f"Cannot use system directory: {sensitive}"
 
     return True, f"Path validated: {abs_path}"
+
+
+def _split_principals(raw_value):
+    return [item.strip() for item in re.split(r"[\s,]+", raw_value or "") if item.strip()]
+
+
+def _normalize_group_name(group):
+    g = (group or "").strip()
+    if not g:
+        return ""
+    return g if g.startswith("@") else f"@{g}"
+
+
+def _build_principal_list(users_raw, groups_raw):
+    users = [u for u in _split_principals(users_raw) if not u.startswith("@")]
+    groups = [_normalize_group_name(g) for g in groups_raw if _normalize_group_name(g)]
+    unique = []
+    seen = set()
+    for principal in users + groups:
+        if principal not in seen:
+            seen.add(principal)
+            unique.append(principal)
+    return " ".join(unique)
 
 
 @bp.route("/")
@@ -182,12 +228,15 @@ def global_settings():
         settings["hosts allow"] = request.form.get("hosts_allow", "")
         settings["hosts deny"] = request.form.get("hosts_deny", "")
 
-        result = write_global_settings(settings)
+        success, message = write_global_settings(settings)
 
-        if result:
-            flash("Settings saved and Samba service restarted", "success")
+        if success:
+            if message:
+                flash(f"Settings saved. {message}", "warning")
+            else:
+                flash("Settings saved and Samba service restarted", "success")
         else:
-            flash("Failed to save settings. Check logs for details", "error")
+            flash(message or "Failed to save settings. Check logs for details", "error")
 
         return redirect("/global-settings")
 
@@ -208,20 +257,28 @@ def global_settings():
 @bp.route("/shares", methods=["GET", "POST"])
 @login_required
 def shares():
+    return _render_shares_page()
+
+
+def _render_shares_page(add_form_data=None, open_add_modal=False):
     has_sudo = check_sudo_access()
-    all_shares = load_shares()
+    all_shares = list_managed_shares()
+    hide_system_shares = os.environ.get("SAMBA_MANAGER_HIDE_SYSTEM_SHARES", "0") == "1"
 
     # Sort shares: system shares first, then local shares
     system_shares = [s for s in all_shares if s["name"] in ["secure-share", "share"]]
     local_shares = [s for s in all_shares if s["name"] not in ["secure-share", "share"]]
-    sorted_shares = system_shares + local_shares
+    sorted_shares = local_shares if hide_system_shares else (system_shares + local_shares)
 
     return render_template(
         "shares.html",
         shares=sorted_shares,
         users=list_system_users(),
         groups=list_system_groups(),
+        disks=discover_disks(),
         has_sudo=has_sudo,
+        add_form_data=add_form_data or {},
+        open_add_modal=open_add_modal,
     )
 
 
@@ -233,20 +290,29 @@ def add_share():
         flash("Error: Sudo access is required to add shares", "error")
         return redirect("/shares")
 
-    name = request.form["name"]
+    form_data = request.form.to_dict(flat=True)
+    form_data["valid_groups"] = request.form.getlist("valid_groups")
+    form_data["write_groups"] = request.form.getlist("write_groups")
+
+    name = request.form["name"].strip()
     path = request.form["path"]
+    share_mode = request.form.get("share_mode", "path").strip().lower()
+    if share_mode not in {"path", "disk"}:
+        share_mode = "path"
+    disk_id = request.form.get("disk_id", "").strip()
+    relative_path = request.form.get("relative_path", "/").strip() or "/"
 
     # Validate share name
     valid_name, name_message = validate_share_name(name)
     if not valid_name:
         flash(f"Invalid share name: {name_message}", "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Check if share name already exists
     all_shares = load_shares()
     if any(s["name"] == name for s in all_shares):
         flash(f'A share with the name "{name}" already exists', "error")
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Check if it's trying to override a system share
     if name in ["secure-share", "share"]:
@@ -254,35 +320,33 @@ def add_share():
             f'Cannot create system share "{name}". Edit /etc/samba/smb.conf directly.',
             "error",
         )
-        return redirect("/shares")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     # Validate and create path if needed
-    valid, message = validate_share_path(path)
-    if not valid:
-        flash(f"Invalid path: {message}", "error")
-        return redirect("/shares")
+    if share_mode == "path":
+        valid, message = validate_share_path(path)
+        if not valid:
+            flash(f"Invalid path: {message}", "error")
+            return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
-    # Process users and groups
-    valid_users = request.form.get("valid_users", "")
-    valid_groups = request.form.getlist("valid_groups")
+    # Process users/groups into Samba principal lists
+    valid_users = _build_principal_list(
+        request.form.get("valid_users", ""), request.form.getlist("valid_groups")
+    )
+    write_list = _build_principal_list(
+        request.form.get("write_list", ""), request.form.getlist("write_groups")
+    )
+    guest_ok = "yes" if request.form.get("guest_ok") else "no"
+    if guest_ok == "no" and not valid_users:
+        flash("For non-guest share, specify at least one valid user or group.", "error")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
-    # Combine users and groups for valid_users field
-    if valid_groups:
-        if valid_users:
-            valid_users = valid_users + "," + ",".join(valid_groups)
-        else:
-            valid_users = ",".join(valid_groups)
-
-    # Process write list users and groups
-    write_list = request.form.get("write_list", "")
-    write_groups = request.form.getlist("write_groups")
-
-    # Combine users and groups for write_list field
-    if write_groups:
-        if write_list:
-            write_list = write_list + "," + ",".join(write_groups)
-        else:
-            write_list = ",".join(write_groups)
+    create_mask = request.form.get("create_mask", "").strip()
+    directory_mask = request.form.get("directory_mask", "").strip()
+    if not create_mask:
+        create_mask = "0664" if guest_ok == "no" else "0666"
+    if not directory_mask:
+        directory_mask = "0775" if guest_ok == "no" else "0777"
 
     # Create new share with normalized key names
     share = {
@@ -291,20 +355,31 @@ def add_share():
         "comment": request.form.get("comment", ""),
         "browseable": "yes" if request.form.get("browseable") else "no",
         "read_only": "yes" if request.form.get("read_only") else "no",
-        "guest_ok": "yes" if request.form.get("guest_ok") else "no",
+        "guest_ok": guest_ok,
         "valid_users": valid_users,
         "write_list": write_list,
-        "create_mask": request.form.get("create_mask", "0744"),
-        "directory_mask": request.form.get("directory_mask", "0755"),
-        "force_group": "smbusers",
+        "create_mask": create_mask,
+        "directory_mask": directory_mask,
+        "force_user": request.form.get("force_user", "").strip(),
+        "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
+        "access_mode": request.form.get("access_mode", "auto").strip().lower(),
+        "mode": share_mode,
+        "disk": {"disk_id": disk_id, "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": relative_path,
+        "enabled": True,
     }
+    share, policy_note = apply_share_access_policy(share)
+    if policy_note:
+        flash(policy_note, "warning")
 
     result = add_or_update_share(share)
     if result:
         flash("Share added successfully and Samba service restarted", "success")
     else:
-        flash("Failed to add share", "error")
+        detail = get_last_error()
+        flash(f"Failed to add share. {detail}" if detail else "Failed to add share", "error")
+        return _render_shares_page(add_form_data=form_data, open_add_modal=True)
 
     return redirect("/shares")
 
@@ -320,6 +395,11 @@ def edit_share():
     original_name = request.form["original_name"]
     name = request.form["name"]
     path = request.form["path"]
+    share_mode = request.form.get("share_mode", "path").strip().lower()
+    if share_mode not in {"path", "disk"}:
+        share_mode = "path"
+    disk_id = request.form.get("disk_id", "").strip()
+    relative_path = request.form.get("relative_path", "/").strip() or "/"
 
     # Check if it's a system share
     if original_name in ["secure-share", "share"]:
@@ -337,34 +417,31 @@ def edit_share():
             return redirect("/shares")
 
     # Validate and create path if needed
-    valid, message = validate_share_path(path)
-    if not valid:
-        flash(f"Invalid path: {message}", "error")
+    if share_mode == "path":
+        valid, message = validate_share_path(path)
+        if not valid:
+            flash(f"Invalid path: {message}", "error")
+            return redirect("/shares")
+        else:
+            print(f"Path validation successful: {message}")
+
+    valid_users = _build_principal_list(
+        request.form.get("valid_users", ""), request.form.getlist("valid_groups")
+    )
+    write_list = _build_principal_list(
+        request.form.get("write_list", ""), request.form.getlist("write_groups")
+    )
+    guest_ok = "yes" if request.form.get("guest_ok") else "no"
+    if guest_ok == "no" and not valid_users:
+        flash("For non-guest share, specify at least one valid user or group.", "error")
         return redirect("/shares")
-    else:
-        print(f"Path validation successful: {message}")
 
-    # Process users and groups
-    valid_users = request.form.get("valid_users", "")
-    valid_groups = request.form.getlist("valid_groups")
-
-    # Combine users and groups for valid_users field
-    if valid_groups:
-        if valid_users:
-            valid_users = valid_users + "," + ",".join(valid_groups)
-        else:
-            valid_users = ",".join(valid_groups)
-
-    # Process write list users and groups
-    write_list = request.form.get("write_list", "")
-    write_groups = request.form.getlist("write_groups")
-
-    # Combine users and groups for write_list field
-    if write_groups:
-        if write_list:
-            write_list = write_list + "," + ",".join(write_groups)
-        else:
-            write_list = ",".join(write_groups)
+    create_mask = request.form.get("create_mask", "").strip()
+    directory_mask = request.form.get("directory_mask", "").strip()
+    if not create_mask:
+        create_mask = "0664" if guest_ok == "no" else "0666"
+    if not directory_mask:
+        directory_mask = "0775" if guest_ok == "no" else "0777"
 
     # Update share with normalized key names
     share = {
@@ -373,14 +450,23 @@ def edit_share():
         "comment": request.form.get("comment", ""),
         "browseable": "yes" if request.form.get("browseable") else "no",
         "read_only": "yes" if request.form.get("read_only") else "no",
-        "guest_ok": "yes" if request.form.get("guest_ok") else "no",
+        "guest_ok": guest_ok,
         "valid_users": valid_users,
         "write_list": write_list,
-        "create_mask": request.form.get("create_mask", "0744"),
-        "directory_mask": request.form.get("directory_mask", "0755"),
-        "force_group": "smbusers",
+        "create_mask": create_mask,
+        "directory_mask": directory_mask,
+        "force_user": request.form.get("force_user", "").strip(),
+        "force_group": request.form.get("force_group", "").strip(),
         "max_connections": request.form.get("max_connections", "10"),
+        "access_mode": request.form.get("access_mode", "auto").strip().lower(),
+        "mode": share_mode,
+        "disk": {"disk_id": disk_id, "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": relative_path,
+        "enabled": True,
     }
+    share, policy_note = apply_share_access_policy(share)
+    if policy_note:
+        flash(policy_note, "warning")
 
     # If name was changed, delete the old share first
     if original_name != name:
@@ -390,7 +476,11 @@ def edit_share():
     if result:
         flash("Share updated successfully and Samba service restarted", "success")
     else:
-        flash("Failed to update share", "error")
+        detail = get_last_error()
+        flash(
+            f"Failed to update share. {detail}" if detail else "Failed to update share",
+            "error",
+        )
 
     return redirect("/shares")
 
@@ -403,7 +493,7 @@ def delete_share_route():
         flash("Error: Sudo access is required to delete shares", "error")
         return redirect("/shares")
 
-    share_name = request.form["name"]
+    share_name = request.form["name"].strip()
 
     # Check if it's a system share
     if share_name in ["secure-share", "share"]:
@@ -414,12 +504,68 @@ def delete_share_route():
         return redirect("/shares")
 
     result = delete_share(share_name)
-    if result:
-        flash("Share deleted successfully and Samba service restarted", "success")
+    remaining_names = {s.get("name", "").strip() for s in load_shares()}
+    if result and share_name not in remaining_names:
+        flash(f'Share "{share_name}" deleted successfully and Samba service restarted', "success")
     else:
-        flash("Failed to delete share", "error")
+        detail = get_last_error()
+        if share_name in remaining_names and not detail:
+            detail = "Share still present after save/reload. Check mounted /etc/samba volume consistency."
+        flash(
+            f'Failed to delete share "{share_name}". {detail}' if detail else f'Failed to delete share "{share_name}"',
+            "error",
+        )
 
     # Force a page refresh to update the UI
+    return redirect("/shares")
+
+
+@bp.route("/shares/prepare-unplug", methods=["POST"])
+@login_required
+def prepare_unplug_share_route():
+    if not check_sudo_access():
+        flash("Error: Sudo access is required to prepare share for unplug", "error")
+        return redirect("/shares")
+
+    share_name = request.form.get("name", "").strip()
+    if not share_name:
+        flash("Share name is required", "error")
+        return redirect("/shares")
+
+    # Prevent operations on internal protected shares.
+    if share_name in ["secure-share", "share"]:
+        flash("System share does not need unplug preparation", "warning")
+        return redirect("/shares")
+
+    ok, message = prepare_share_for_unplug(share_name)
+    flash(message, "success" if ok else "error")
+    return redirect("/shares")
+
+
+@bp.route("/shares/toggle-enabled", methods=["POST"])
+@login_required
+def toggle_share_enabled_route():
+    if not check_sudo_access():
+        flash("Error: Sudo access is required to enable/disable shares", "error")
+        return redirect("/shares")
+
+    share_name = request.form.get("name", "").strip()
+    enabled = request.form.get("enabled", "0") == "1"
+    if not share_name:
+        flash("Share name is required", "error")
+        return redirect("/shares")
+
+    if set_share_enabled(share_name, enabled):
+        state_text = "enabled" if enabled else "disabled"
+        flash(f'Share "{share_name}" {state_text}', "success")
+    else:
+        detail = get_last_error()
+        flash(
+            f'Failed to update share "{share_name}". {detail}'
+            if detail
+            else f'Failed to update share "{share_name}"',
+            "error",
+        )
     return redirect("/shares")
 
 
@@ -458,19 +604,28 @@ def add_user():
         flash("Username and password are required", "error")
         return redirect("/users")
 
+    valid, message = validate_username(username)
+    if not valid:
+        flash(f"Invalid username: {message}", "error")
+        return redirect("/users")
+
     result = add_samba_user(username, password, create_system_user)
 
     if result:
         flash(f"User {username} added successfully", "success")
     else:
-        flash(f"Failed to add user {username}", "error")
+        detail = get_last_error()
+        flash(
+            f"Failed to add user {username}. {detail}" if detail else f"Failed to add user {username}",
+            "error",
+        )
 
     return redirect("/users")
 
 
 @bp.route("/users/reset-password/<username>", methods=["POST"])
 @login_required
-def reset_samba_password(username):
+def reset_samba_password_route(username):
     """Reset a Samba user's password"""
     if not check_sudo_access():
         flash("Error: Sudo access is required to reset passwords", "error")
@@ -487,26 +642,11 @@ def reset_samba_password(username):
         flash("Password is required", "error")
         return redirect("/users")
 
-    try:
-        # Use smbpasswd to reset the password
-        process = subprocess.Popen(
-            ["sudo", "smbpasswd", "-s", username],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Send the password twice (for confirmation)
-        stdout, stderr = process.communicate(input=f"{password}\n{password}\n")
-
-        if process.returncode != 0:
-            flash(f"Failed to reset password: {stderr}", "error")
-        else:
-            flash(f"Password for {username} reset successfully", "success")
-
-    except Exception as e:
-        flash(f"Error: {str(e)}", "error")
+    if reset_samba_password(username, password):
+        flash(f"Password for {username} reset successfully", "success")
+    else:
+        detail = get_last_error()
+        flash(f"Failed to reset password: {detail}" if detail else "Failed to reset password", "error")
 
     return redirect("/users")
 
@@ -624,19 +764,15 @@ def delete_samba_user(username):
         flash(f"User {username} is not a Samba user", "error")
         return redirect("/users")
 
+    delete_system_user = request.form.get("delete_system_user") == "on"
     try:
-        # Use smbpasswd to delete the user
-        result = subprocess.run(
-            ["sudo", "smbpasswd", "-x", username],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode != 0:
-            flash(f"Failed to delete user: {result.stderr}", "error")
+        result = remove_samba_user(username, delete_system_user=delete_system_user)
+        if not result:
+            detail = get_last_error()
+            flash(f"Failed to delete user: {detail}" if detail else "Failed to delete user", "error")
         else:
-            flash(f"User {username} deleted successfully", "success")
+            suffix = " (system user removed)" if delete_system_user else ""
+            flash(f"User {username} deleted successfully{suffix}", "success")
 
     except Exception as e:
         flash(f"Error: {str(e)}", "error")
@@ -821,7 +957,10 @@ def quick_setup():
             "map to guest": "Bad User" if guest_access == "yes" else "Never",
         }
 
-        write_global_settings(global_settings)
+        success, message = write_global_settings(global_settings)
+        if not success:
+            flash(message or "Failed to save Samba global settings during quick setup.", "error")
+            return redirect("/setup")
 
         # Create share
         share = {
@@ -1330,7 +1469,7 @@ def help_page():
 @login_required
 def api_shares():
     """API endpoint for shares"""
-    all_shares = load_shares()
+    all_shares = list_managed_shares()
 
     # Convert to simpler JSON format
     shares_json = [
@@ -1342,11 +1481,24 @@ def api_shares():
             "guest_ok": share.get("guest_ok", "no") == "yes",
             "valid_users": share.get("valid_users", ""),
             "max_connections": share.get("max_connections", "0"),
+            "enabled": bool(share.get("enabled", True)),
+            "runtime_state": share.get("runtime_state", "unknown"),
+            "mode": share.get("mode", "path"),
         }
         for share in all_shares
     ]
 
     return jsonify(shares_json)
+
+
+@bp.route("/api/shares/<name>/diagnostics", methods=["GET"])
+@login_required
+def api_share_diagnostics(name):
+    """Diagnose why a share path is / isn't visible inside the container."""
+    for s in list_managed_shares():
+        if s["name"] == name:
+            return jsonify(collect_share_diagnostics(s.get("path", "")))
+    return jsonify({"error": "not found"}), 404
 
 
 @bp.route("/api/status", methods=["GET"])
@@ -1597,53 +1749,29 @@ def static_files(filename):
     return response
 
 
+@bp.route("/api/files/browse")
 @bp.route("/api/browse-directory")
 @login_required
 def browse_directory():
-    """API endpoint to browse server directories for share path selection"""
-    path = request.args.get('path', '/')
-    
-    # Security: prevent directory traversal attacks
-    if '..' in path or not path.startswith('/'):
-        return jsonify({"success": False, "error": "Invalid path"}), 400
-    
+    """Secure directory browser for share path selection."""
+    raw_path = request.args.get("path", "/shares")
+    path = unquote(raw_path).strip()
+    if not path:
+        path = "/shares"
+
     try:
-        # Check if path exists and is a directory
-        if not os.path.exists(path):
-            return jsonify({"success": False, "error": "Path does not exist"}), 404
-            
-        if not os.path.isdir(path):
-            return jsonify({"success": False, "error": "Path is not a directory"}), 400
-        
-        # Get directory contents
-        contents = []
-        try:
-            items = os.listdir(path)
-            for item in sorted(items):
-                item_path = os.path.join(path, item)
-                try:
-                    stat_info = os.stat(item_path)
-                    item_type = 'directory' if os.path.isdir(item_path) else 'file'
-                    contents.append({
-                        'name': item,
-                        'type': item_type,
-                        'size': stat_info.st_size if item_type == 'file' else 0,
-                        'modified': datetime.datetime.fromtimestamp(stat_info.st_mtime).isoformat()
-                    })
-                except (OSError, PermissionError):
-                    # Skip items we can't access
-                    continue
-        except (OSError, PermissionError):
-            return jsonify({"success": False, "error": "Permission denied"}), 403
-        
-        return jsonify({
-            "success": True,
-            "path": path,
-            "contents": contents
-        })
-        
+        result = browse_directories(path)
+        return jsonify(result)
+    except ValueError:
+        return jsonify({"error": "Invalid path"}), 400
+    except PermissionError:
+        return jsonify({"error": "Access denied for this path"}), 403
+    except FileNotFoundError:
+        return jsonify({"error": "Path does not exist"}), 404
+    except NotADirectoryError:
+        return jsonify({"error": "Path is not a directory"}), 400
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 @bp.route("/enable", methods=["GET"])

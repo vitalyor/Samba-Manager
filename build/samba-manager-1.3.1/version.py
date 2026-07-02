@@ -2,7 +2,7 @@
 Version management for Samba Manager
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __author__ = "Lyarinet"
 __license__ = "MIT"
 __description__ = "Web-based interface for managing Samba file sharing on Linux systems"
@@ -51,6 +51,16 @@ VERSION_HISTORY = {
             "Health check improvements",
             "Kubernetes manifests (beta)",
             "Advanced monitoring capabilities",
+        ],
+    },
+    "1.3.1": {
+        "date": "2026-07-02",
+        "description": "Fix external disks not appearing after mount (Docker mount propagation)",
+        "features": [
+            "Detect udevil mount stub (.udevil-mount-point) so empty shares are not published",
+            "Keep shares as 'Waiting Disk' until the real mount is visible, then auto-recover",
+            "Share path diagnostics endpoint and UI Diagnose button (findmnt/mountpoint/stub)",
+            "Docker Compose rslave propagation example and README guidance",
         ],
     },
 }

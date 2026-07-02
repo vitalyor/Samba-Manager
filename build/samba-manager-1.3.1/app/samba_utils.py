@@ -1,10 +1,14 @@
 import grp
+import json
 import os
 import pwd
 import re
 import shlex
 import subprocess
 import tempfile
+import threading
+import time
+import unicodedata
 from pathlib import Path
 
 # Use local configuration files for development
@@ -20,6 +24,222 @@ else:
     SMB_CONF = "/etc/samba/smb.conf"
     SHARE_CONF = "/etc/samba/shares.conf"
     ACTUAL_SMB_CONF = SMB_CONF
+    SHARE_PROFILE_CONF = "/etc/samba/share_profiles.json"
+
+if DEV_MODE:
+    SHARE_PROFILE_CONF = "./share_profiles.json"
+
+
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+RECONCILE_INTERVAL_SECONDS = max(
+    1, int(os.environ.get("SAMBA_MANAGER_DISK_RECONCILE_INTERVAL", "5"))
+)
+RECONCILE_ENABLED = env_bool("SAMBA_MANAGER_DISK_RECONCILE_ENABLED", default=True)
+AUTO_CREATE_PROFILES = env_bool("SAMBA_MANAGER_SHARE_PROFILE_AUTOINIT", default=True)
+RECONNECT_RESET_SESSIONS = env_bool(
+    "SAMBA_MANAGER_DISK_RECONNECT_RESET_SESSIONS", default=True
+)
+
+LAST_ERROR = ""
+_PROFILE_LOCK = threading.RLock()
+_RECONCILER_THREAD = None
+
+
+def is_container_runtime():
+    return os.path.exists("/.dockerenv")
+
+
+def is_root_user():
+    return os.geteuid() == 0
+
+
+def with_privilege(cmd):
+    """Run command directly as root in container; fallback to sudo outside."""
+    if is_root_user() or DEV_MODE:
+        return cmd
+    return ["sudo"] + cmd
+
+
+def set_last_error(message):
+    global LAST_ERROR
+    LAST_ERROR = message or ""
+
+
+def get_last_error():
+    return LAST_ERROR
+
+
+def normalize_share_name(name):
+    return unicodedata.normalize("NFC", str(name or "").strip())
+
+
+def _default_profile_doc():
+    return {"version": 1, "shares": []}
+
+
+def _load_profile_doc():
+    if not os.path.exists(SHARE_PROFILE_CONF):
+        return _default_profile_doc()
+    try:
+        with open(SHARE_PROFILE_CONF, "r") as f:
+            raw = f.read().strip()
+        if not raw:
+            return _default_profile_doc()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return _default_profile_doc()
+        if "shares" not in data or not isinstance(data.get("shares"), list):
+            data["shares"] = []
+        if "version" not in data:
+            data["version"] = 1
+        return data
+    except Exception as e:
+        print(f"Warning: failed to read share profile store {SHARE_PROFILE_CONF}: {e}")
+        return _default_profile_doc()
+
+
+def _save_profile_doc(doc):
+    os.makedirs(os.path.dirname(SHARE_PROFILE_CONF) or ".", exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+        json.dump(doc, temp_file, indent=2, ensure_ascii=False)
+        temp_path = temp_file.name
+    subprocess.run(with_privilege(["cp", temp_path, SHARE_PROFILE_CONF]), check=True)
+    subprocess.run(with_privilege(["chmod", "644", SHARE_PROFILE_CONF]), check=True)
+    os.unlink(temp_path)
+
+
+def _share_to_profile(share):
+    return {
+        "name": normalize_share_name(share.get("name")),
+        "enabled": True,
+        "mode": "path",
+        "disk": {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+        "relative_path": "/",
+        "resolved_path": share.get("path", ""),
+        "runtime_state": "online",
+        "share": {
+            "comment": share.get("comment", ""),
+            "browseable": share.get("browseable", "yes"),
+            "read_only": share.get("read_only", "no"),
+            "guest_ok": share.get("guest_ok", "no"),
+            "valid_users": share.get("valid_users", ""),
+            "write_list": share.get("write_list", ""),
+            "create_mask": share.get("create_mask", "0664"),
+            "directory_mask": share.get("directory_mask", "0775"),
+            "force_user": share.get("force_user", ""),
+            "force_group": share.get("force_group", ""),
+            "max_connections": share.get("max_connections", "0"),
+            "path": share.get("path", ""),
+        },
+    }
+
+
+def ensure_share_profiles_initialized():
+    if not AUTO_CREATE_PROFILES:
+        return
+    with _PROFILE_LOCK:
+        doc = _load_profile_doc()
+        if doc.get("shares"):
+            return
+        print("Initializing share profile registry from current Samba config")
+        current_shares = load_shares()
+        doc["shares"] = [_share_to_profile(s) for s in current_shares]
+        _save_profile_doc(doc)
+
+
+def _discover_disks_from_lsblk():
+    disks = []
+    try:
+        result = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,KNAME,TYPE,FSTYPE,UUID,PARTUUID,SERIAL,WWN,LABEL,MOUNTPOINT,SIZE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return disks
+        data = json.loads(result.stdout or "{}")
+
+        def walk(nodes):
+            for node in nodes or []:
+                mountpoint = (node.get("mountpoint") or "").strip()
+                if mountpoint:
+                    disks.append(
+                        {
+                            "disk_id": (
+                                (f"partuuid:{node.get('partuuid')}" if node.get("partuuid") else "")
+                                or (f"uuid:{node.get('uuid')}" if node.get("uuid") else "")
+                                or (f"serial:{node.get('serial')}" if node.get("serial") else "")
+                                or (f"wwn:{node.get('wwn')}" if node.get("wwn") else "")
+                                or f"mount:{mountpoint}"
+                            ),
+                            "mountpoint": mountpoint,
+                            "label": node.get("label") or "",
+                            "fstype": node.get("fstype") or "",
+                            "uuid": node.get("uuid") or "",
+                            "partuuid": node.get("partuuid") or "",
+                            "serial": node.get("serial") or "",
+                            "wwn": node.get("wwn") or "",
+                            "size": node.get("size") or "",
+                        }
+                    )
+                walk(node.get("children") or [])
+
+        walk(data.get("blockdevices") or [])
+    except Exception as e:
+        print(f"Warning: lsblk discovery failed: {e}")
+    return disks
+
+
+def discover_disks():
+    roots = [Path(r).resolve() for r in get_allowed_share_roots()]
+    disk_map = {}
+    for disk in _discover_disks_from_lsblk():
+        mp = disk.get("mountpoint")
+        if not mp:
+            continue
+        try:
+            resolved = str(Path(mp).resolve())
+        except Exception:
+            continue
+        if not any(resolved == str(root) or str(root) in Path(resolved).parents for root in roots):
+            continue
+        disk["mountpoint"] = resolved
+        disk_map[disk["disk_id"]] = disk
+
+    # Fallback: treat top-level directories under allowed roots as pseudo disks.
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            pseudo_id = f"path:{entry.name}"
+            disk_map.setdefault(
+                pseudo_id,
+                {
+                    "disk_id": pseudo_id,
+                    "mountpoint": str(entry.resolve()),
+                    "label": entry.name,
+                    "fstype": "",
+                    "uuid": "",
+                    "partuuid": "",
+                    "serial": "",
+                    "wwn": "",
+                    "size": "",
+                },
+            )
+    return list(disk_map.values())
 
 
 def parse_share_section(content):
@@ -83,6 +303,108 @@ def parse_config_content(content):
             current_section[param_name] = param_value
 
     return sections
+
+
+def render_config_sections(sections, include_path=None):
+    """Render Samba config sections with [global] first and include last in [global]."""
+    output = []
+    ordered_section_names = []
+    if "global" in sections:
+        ordered_section_names.append("global")
+    ordered_section_names.extend(
+        [name for name in sections.keys() if name != "global"]
+    )
+
+    for section_name in ordered_section_names:
+        section_params = dict(sections.get(section_name, {}))
+        output.append(f"[{section_name}]")
+
+        if section_name == "global":
+            if include_path:
+                # Keep include strictly as the last directive in [global]
+                section_params.pop("include", None)
+            for param_name, param_value in section_params.items():
+                output.append(f"    {param_name} = {param_value}")
+            if include_path:
+                output.append(f"    include = {include_path}")
+        else:
+            for param_name, param_value in section_params.items():
+                output.append(f"    {param_name} = {param_value}")
+
+        output.append("")
+
+    return "\n".join(output).rstrip() + "\n"
+
+
+def testparm_has_warnings_or_service_section_error(output_text):
+    lowered = (output_text or "").lower()
+    if "unknown parameter encountered" in lowered:
+        return True
+    if "global parameter" in lowered and "service section" in lowered:
+        return True
+    return False
+
+
+def get_allowed_share_roots():
+    raw = os.environ.get("ALLOWED_SHARE_ROOTS", "/shares")
+    roots = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        roots.append(str(Path(value).resolve()))
+    return roots or ["/shares"]
+
+
+def _path_within_root(path_value, root_value):
+    path_obj = Path(path_value).resolve()
+    root_obj = Path(root_value).resolve()
+    return path_obj == root_obj or root_obj in path_obj.parents
+
+
+def browse_directories(path_value, allowed_roots=None):
+    if not path_value or not str(path_value).startswith("/"):
+        raise ValueError("Invalid path")
+
+    roots = allowed_roots or get_allowed_share_roots()
+    request_path = Path(path_value).resolve()
+
+    matching_root = None
+    for root in roots:
+        if _path_within_root(request_path, root):
+            matching_root = Path(root).resolve()
+            break
+    if matching_root is None:
+        raise PermissionError("Path is outside allowed roots")
+
+    if not request_path.exists():
+        raise FileNotFoundError("Path does not exist")
+    if not request_path.is_dir():
+        raise NotADirectoryError("Path is not a directory")
+
+    parent = None
+    if request_path != matching_root:
+        parent_candidate = request_path.parent.resolve()
+        if _path_within_root(parent_candidate, matching_root):
+            parent = str(parent_candidate)
+
+    directories = []
+    for entry in sorted(request_path.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            resolved = entry.resolve()
+        except Exception:
+            continue
+        if not _path_within_root(resolved, matching_root):
+            continue
+        if not resolved.is_dir():
+            continue
+        directories.append({"name": entry.name, "path": str(resolved)})
+
+    return {
+        "current_path": str(request_path),
+        "parent": parent,
+        "directories": directories,
+    }
 
 
 # Function to auto-detect share directories
@@ -151,7 +473,7 @@ SHARE_DIRS = detect_share_directories()
 
 def check_sudo_access():
     """Check if the application has sudo access to manage Samba"""
-    if DEV_MODE:
+    if DEV_MODE or is_root_user():
         return True  # In development mode, we don't need sudo
     try:
         result = subprocess.run(["sudo", "-n", "true"], capture_output=True)
@@ -183,9 +505,19 @@ def run_command(cmd, input_str=None):
 def restart_samba_service():
     """Restart Samba service with proper error handling"""
     try:
+        # Container-friendly reload path first
+        reload_result = subprocess.run(
+            ["smbcontrol", "all", "reload-config"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if reload_result.returncode == 0:
+            return True
+
         # First try systemctl
         print("Attempting to restart Samba services with systemctl")
-        systemctl_cmd = ["sudo", "systemctl", "restart", "smbd.service", "nmbd.service"]
+        systemctl_cmd = with_privilege(["systemctl", "restart", "smbd.service", "nmbd.service"])
         result = subprocess.run(
             systemctl_cmd, capture_output=True, text=True, check=False
         )
@@ -196,8 +528,8 @@ def restart_samba_service():
 
         # If systemctl fails, try service command
         print("systemctl failed, trying service command")
-        service_cmd1 = ["sudo", "service", "smbd", "restart"]
-        service_cmd2 = ["sudo", "service", "nmbd", "restart"]
+        service_cmd1 = with_privilege(["service", "smbd", "restart"])
+        service_cmd2 = with_privilege(["service", "nmbd", "restart"])
 
         result1 = subprocess.run(
             service_cmd1, capture_output=True, text=True, check=False
@@ -212,8 +544,8 @@ def restart_samba_service():
 
         # If both methods fail, try init.d scripts
         print("service command failed, trying init.d scripts")
-        init_cmd1 = ["sudo", "/etc/init.d/smbd", "restart"]
-        init_cmd2 = ["sudo", "/etc/init.d/nmbd", "restart"]
+        init_cmd1 = with_privilege(["/etc/init.d/smbd", "restart"])
+        init_cmd2 = with_privilege(["/etc/init.d/nmbd", "restart"])
 
         result1 = subprocess.run(init_cmd1, capture_output=True, text=True, check=False)
         result2 = subprocess.run(init_cmd2, capture_output=True, text=True, check=False)
@@ -233,6 +565,38 @@ def get_samba_status():
     """Get the status of the Samba service"""
     if DEV_MODE:
         return {"smbd": "active (dev)", "nmbd": "active (dev)"}
+
+    # Container/runtime-first check: process presence and listening ports.
+    try:
+        smbd_proc = subprocess.run(
+            ["pgrep", "-x", "smbd"], capture_output=True, text=True, check=False
+        )
+        nmbd_proc = subprocess.run(
+            ["pgrep", "-x", "nmbd"], capture_output=True, text=True, check=False
+        )
+        if smbd_proc.returncode == 0 or nmbd_proc.returncode == 0:
+            return {
+                "smbd": "active" if smbd_proc.returncode == 0 else "inactive",
+                "nmbd": "active" if nmbd_proc.returncode == 0 else "inactive",
+            }
+    except Exception:
+        pass
+
+    try:
+        ss_result = subprocess.run(
+            ["ss", "-lnt"], capture_output=True, text=True, check=False
+        )
+        if ss_result.returncode == 0:
+            output = ss_result.stdout
+            smbd_active = ":139" in output or ":445" in output
+            # nmbd is UDP/137, but if Samba ports are open we treat stack as active fallback.
+            return {
+                "smbd": "active" if smbd_active else "inactive",
+                "nmbd": "active" if smbd_active else "inactive",
+            }
+    except Exception:
+        pass
+
     try:
         # Try systemctl first (for systemd systems)
         smbd = subprocess.run(
@@ -449,13 +813,8 @@ def write_global_settings(settings):
             else:
                 sections["global"]["include"] = "/etc/samba/shares.conf"
 
-        # Convert the sections back to a configuration string
-        new_config = ""
-        for section_name, section_params in sections.items():
-            new_config += f"[{section_name}]\n"
-            for param_name, param_value in section_params.items():
-                new_config += f"    {param_name} = {param_value}\n"
-            new_config += "\n"
+        include_path = "./shares.conf" if DEV_MODE else "/etc/samba/shares.conf"
+        new_config = render_config_sections(sections, include_path=include_path)
 
         # Write the configuration to a temporary file
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
@@ -463,6 +822,7 @@ def write_global_settings(settings):
             temp_path = temp_file.name
 
         success = True
+        warning_message = ""
 
         if DEV_MODE:
             # In dev mode, first update the local configuration file
@@ -472,19 +832,17 @@ def write_global_settings(settings):
 
             if local_result.returncode != 0:
                 print(f"Error writing to local config: {local_result.stderr}")
-                success = False
+                return False, f"Error writing local Samba config: {local_result.stderr.strip()}"
 
             # Also try to update the system config if we have sudo access
             try:
-                # Check if we have sudo access
                 sudo_check = subprocess.run(
                     ["sudo", "-n", "true"], capture_output=True, text=True, check=False
                 )
 
                 if sudo_check.returncode == 0:
-                    # We have sudo access, update the system config
                     system_result = subprocess.run(
-                        ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
+                        with_privilege(["cp", temp_path, "/etc/samba/smb.conf"]),
                         capture_output=True,
                         text=True,
                         check=False,
@@ -493,7 +851,6 @@ def write_global_settings(settings):
                     if system_result.returncode == 0:
                         print("Updated system Samba configuration")
 
-                        # Also update the system shares.conf
                         with open("./shares.conf", "r") as local_shares:
                             local_shares_content = local_shares.read()
 
@@ -504,7 +861,7 @@ def write_global_settings(settings):
                             shares_temp_path = shares_temp.name
 
                         shares_result = subprocess.run(
-                            ["sudo", "cp", shares_temp_path, "/etc/samba/shares.conf"],
+                            with_privilege(["cp", shares_temp_path, "/etc/samba/shares.conf"]),
                             capture_output=True,
                             text=True,
                             check=False,
@@ -515,31 +872,37 @@ def write_global_settings(settings):
                         if shares_result.returncode == 0:
                             print("Updated system shares configuration")
 
-                            # Restart the system services
-                            restart_result = subprocess.run(
-                                ["sudo", "systemctl", "restart", "smbd", "nmbd"],
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                            )
-
-                            if restart_result.returncode == 0:
-                                print("Restarted system Samba services")
-                            else:
-                                print(
-                                    f"Failed to restart system services: {restart_result.stderr}"
+                            restart_result = restart_samba_service()
+                            if not restart_result:
+                                warning_message = (
+                                    "Configuration saved locally, but Samba could not be restarted on the system. "
+                                    "Check logs for service restart details."
                                 )
+                        else:
+                            print(
+                                f"Failed to update system shares config: {shares_result.stderr}"
+                            )
+                            warning_message = (
+                                "Configuration saved locally, but system shares configuration was not updated. "
+                                "Check logs for details."
+                            )
                     else:
                         print(f"Failed to update system config: {system_result.stderr}")
+                        warning_message = (
+                            "Configuration saved locally, but system Samba config could not be updated. "
+                            "Check logs for details."
+                        )
                 else:
                     print("No sudo access available, skipping system config update")
             except Exception as sudo_error:
                 print(f"Error updating system config: {str(sudo_error)}")
-                # Continue with local config only
+                warning_message = (
+                    "Configuration saved locally, but system Samba config update failed. "
+                    "Check logs for details."
+                )
         else:
-            # In production mode, use sudo for the system config
             system_result = subprocess.run(
-                ["sudo", "cp", temp_path, "/etc/samba/smb.conf"],
+                with_privilege(["cp", temp_path, "/etc/samba/smb.conf"]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -547,11 +910,11 @@ def write_global_settings(settings):
 
             if system_result.returncode != 0:
                 print(f"Error writing config: {system_result.stderr}")
-                success = False
+                os.unlink(temp_path)
+                return False, f"Error writing system Samba config: {system_result.stderr.strip()}"
             else:
                 print("Updated system Samba configuration")
 
-                # Also update the local copy for reference
                 try:
                     local_result = subprocess.run(
                         ["cp", temp_path, "./smb.conf"],
@@ -564,83 +927,77 @@ def write_global_settings(settings):
                 except Exception as e:
                     print(f"Error updating local copy: {str(e)}")
 
-        # Clean up the temporary file
         os.unlink(temp_path)
-
-        if not success:
-            return False
 
         # Validate the configuration
         if DEV_MODE:
-            # In dev mode, check if testparm is available
             testparm_check = subprocess.run(
                 ["which", "testparm"], capture_output=True, text=True, check=False
             )
             if testparm_check.returncode == 0:
-                # testparm is available, validate the local config
                 validate_cmd = subprocess.run(
                     ["testparm", "-s", SMB_CONF],
                     capture_output=True,
                     text=True,
                     check=False,
                 )
-                if validate_cmd.returncode != 0:
-                    # If validation fails, restore the backup
+                validate_output = (validate_cmd.stdout or "") + "\n" + (
+                    validate_cmd.stderr or ""
+                )
+                if validate_cmd.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                    validate_output
+                ):
                     subprocess.run(["cp", backup_path, SMB_CONF], check=False)
-                    print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False
+                    print(f"Invalid configuration: {validate_output}")
+                    return False, f"Invalid Samba configuration: {validate_output.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in dev mode")
         else:
-            # In production mode, check if testparm is available
             testparm_check = subprocess.run(
                 ["which", "testparm"], capture_output=True, text=True, check=False
             )
             if testparm_check.returncode == 0:
-                # testparm is available, validate the system config
                 validate_cmd = subprocess.run(
-                    ["sudo", "testparm", "-s", "/etc/samba/smb.conf"],
+                    with_privilege(["testparm", "-s", "/etc/samba/smb.conf"]),
                     capture_output=True,
                     text=True,
                     check=False,
                 )
 
-                if validate_cmd.returncode != 0:
-                    # If validation fails, restore the backup
+                validate_output = (validate_cmd.stdout or "") + "\n" + (
+                    validate_cmd.stderr or ""
+                )
+                if validate_cmd.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                    validate_output
+                ):
                     subprocess.run(
-                        ["sudo", "cp", backup_path, "/etc/samba/smb.conf"], check=False
+                        with_privilege(["cp", backup_path, "/etc/samba/smb.conf"]), check=False
                     )
-                    print(f"Invalid configuration: {validate_cmd.stderr}")
-                    return False
+                    print(f"Invalid configuration: {validate_output}")
+                    return False, f"Invalid Samba configuration: {validate_output.strip()}"
             else:
                 print("testparm not available, skipping configuration validation in production mode")
 
-        # Restart Samba services
         if DEV_MODE:
-            # In development mode, we already tried to restart the system services if we had sudo access
+            if warning_message:
+                print("Development mode: Local configuration updated successfully with warnings")
+                return True, warning_message
             print("Development mode: Local configuration updated successfully")
-        else:
-            # In production mode, restart the services
-            restart_cmd = subprocess.run(
-                ["sudo", "systemctl", "restart", "smbd", "nmbd"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            return True, ""
 
-            if restart_cmd.returncode != 0:
-                print(f"Error restarting services: {restart_cmd.stderr}")
-                return False
-            else:
-                print("Restarted system Samba services")
+        restart_result = restart_samba_service()
+        if not restart_result:
+            print("Error restarting Samba services")
+            return False, "Saved configuration, but Samba service restart failed. Check logs for details."
 
-        return True
+        print("Restarted system Samba services")
+        return True, ""
     except Exception as e:
         print(f"Exception in write_global_settings: {str(e)}")
         import traceback
 
         traceback.print_exc()
-        return False
+        return False, "Exception writing Samba settings. Check logs for details."
 
 
 def parse_user_group_list(value):
@@ -649,7 +1006,7 @@ def parse_user_group_list(value):
     if not value:
         return [], []
 
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    items = [item.strip() for item in re.split(r"[\s,]+", value) if item.strip()]
     users = [item for item in items if not item.startswith("@")]
     groups = [item for item in items if item.startswith("@")]
 
@@ -657,7 +1014,7 @@ def parse_user_group_list(value):
 
 
 def format_user_group_list(users, groups):
-    """Format users and groups into a single comma-separated string."""
+    """Format users and groups into a single space-separated string."""
     all_items = []
     if users:
         if isinstance(users, list):
@@ -671,7 +1028,489 @@ def format_user_group_list(users, groups):
         else:
             all_items.append(groups)
 
-    return ",".join(all_items) if all_items else ""
+    return " ".join(all_items) if all_items else ""
+
+
+def _resolve_profile_disk_mount(profile, disks):
+    disk_meta = profile.get("disk") or {}
+    disk_id = (disk_meta.get("disk_id") or "").strip()
+    partuuid = (disk_meta.get("partuuid") or "").strip()
+    uuid = (disk_meta.get("uuid") or "").strip()
+    serial = (disk_meta.get("serial") or "").strip()
+    wwn = (disk_meta.get("wwn") or "").strip()
+
+    for disk in disks:
+        if disk_id and disk.get("disk_id") == disk_id:
+            return disk
+        if partuuid and partuuid == disk.get("partuuid"):
+            return disk
+        if uuid and uuid == disk.get("uuid"):
+            return disk
+        if serial and serial == disk.get("serial"):
+            return disk
+        if wwn and wwn == disk.get("wwn"):
+            return disk
+    return None
+
+
+_STUB_NOTE = (
+    "Диск не виден внутри контейнера — проверьте mount propagation (rslave) "
+    "или перезапустите контейнер"
+)
+
+
+def _is_udevil_stub(path):
+    # ponytail: маркер .udevil-mount-point виден только когда реальный fs
+    # НЕ примонтирован поверх (внутри нашего mount namespace).
+    try:
+        return os.path.exists(os.path.join(path, ".udevil-mount-point"))
+    except Exception:
+        return False
+
+
+def _resolved_share_from_profile(profile, disks):
+    mode = (profile.get("mode") or "path").strip().lower()
+    enabled = bool(profile.get("enabled", True))
+    share_data = dict(profile.get("share") or {})
+    share_name = normalize_share_name(profile.get("name"))
+    share_data["name"] = share_name
+    profile["runtime_state"] = "disabled" if not enabled else "unknown"
+    profile["runtime_note"] = ""
+
+    if not enabled:
+        return None
+
+    if mode == "disk":
+        disk = _resolve_profile_disk_mount(profile, disks)
+        if not disk:
+            profile["runtime_state"] = "offline"
+            profile["resolved_path"] = ""
+            return None
+        relative_path = (profile.get("relative_path") or "/").strip()
+        try:
+            rel = relative_path.lstrip("/")
+            resolved_path = str(Path(disk["mountpoint"], rel).resolve())
+        except Exception:
+            profile["runtime_state"] = "error"
+            return None
+        profile["resolved_path"] = resolved_path
+        share_data["path"] = resolved_path
+        if _is_udevil_stub(resolved_path):
+            profile["runtime_state"] = "offline"
+            profile["runtime_note"] = _STUB_NOTE
+            return None
+        profile["runtime_state"] = "online"
+        return share_data
+
+    # path mode
+    fixed_path = (share_data.get("path") or profile.get("resolved_path") or "").strip()
+    profile["resolved_path"] = fixed_path
+    share_data["path"] = fixed_path
+    if fixed_path and _is_udevil_stub(fixed_path):
+        # Заглушка udevil: путь существует, но реальный диск не примонтирован.
+        profile["runtime_state"] = "offline"
+        profile["runtime_note"] = _STUB_NOTE
+        return None
+    path_exists = bool(fixed_path and os.path.exists(fixed_path))
+    profile["runtime_state"] = "online" if path_exists else "offline"
+    # Keep path-mode shares visible in UI as "Waiting Disk", but do not publish
+    # them in Samba while the backing path is missing.
+    if not path_exists:
+        return None
+    return share_data
+
+
+def collect_share_diagnostics(path):
+    info = {
+        "path": path,
+        "exists": os.path.exists(path) if path else False,
+        "is_mountpoint": os.path.ismount(path) if path else False,
+        "is_udevil_stub": _is_udevil_stub(path) if path else False,
+        "entry_count": None,
+        "findmnt": "",
+    }
+    try:
+        info["entry_count"] = len(os.listdir(path))
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            with_privilege(["findmnt", "-T", path, "-o", "TARGET,SOURCE,FSTYPE,PROPAGATION"]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        info["findmnt"] = (r.stdout or r.stderr or "").strip()
+    except Exception:
+        pass
+    return info
+
+
+def _render_shares_conf_content(shares):
+    reverse_key_mapping = {
+        "path": "path",
+        "comment": "comment",
+        "browseable": "browseable",
+        "read_only": "read only",
+        "guest_ok": "guest ok",
+        "valid_users": "valid users",
+        "write_list": "write list",
+        "create_mask": "create mask",
+        "directory_mask": "directory mask",
+        "force_user": "force user",
+        "force_group": "force group",
+        "max_connections": "max connections",
+    }
+    lines = ["# Samba shares configuration", ""]
+    for s in shares:
+        lines.append(f"[{s['name']}]")
+        for our_key in reverse_key_mapping:
+            value = str(s.get(our_key, "")).strip()
+            if not value:
+                continue
+            lines.append(f"   {reverse_key_mapping[our_key]} = {value}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _validate_shares_content(content):
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_shares:
+        temp_shares.write(content)
+        temp_shares_path = temp_shares.name
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_smb:
+        temp_smb.write("[global]\n")
+        temp_smb.write(f"   include = {temp_shares_path}\n\n")
+        temp_smb_path = temp_smb.name
+    try:
+        validate_cmd = with_privilege(["testparm", "-s", temp_smb_path])
+        result = subprocess.run(validate_cmd, capture_output=True, text=True, check=False)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode != 0 or "Unknown parameter encountered" in output:
+            set_last_error(output.strip())
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(temp_shares_path)
+        except Exception:
+            pass
+        try:
+            os.unlink(temp_smb_path)
+        except Exception:
+            pass
+
+
+def reconcile_share_profiles_once():
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        disks = discover_disks()
+        effective_shares = []
+        reconnected_share_names = []
+        for profile in profiles:
+            previous_state = str(profile.get("runtime_state") or "").strip().lower()
+            share = _resolved_share_from_profile(profile, disks)
+            current_state = str(profile.get("runtime_state") or "").strip().lower()
+            if previous_state == "offline" and current_state == "online":
+                name = normalize_share_name(profile.get("name"))
+                if name:
+                    reconnected_share_names.append(name)
+            if share:
+                effective_shares.append(share)
+
+        new_content = _render_shares_conf_content(effective_shares)
+        old_content = ""
+        if os.path.exists(SHARE_CONF):
+            try:
+                with open(SHARE_CONF, "r") as f:
+                    old_content = f.read()
+            except Exception:
+                old_content = ""
+
+        # Persist runtime profile state even if shares.conf does not change.
+        _save_profile_doc(doc)
+
+        if new_content == old_content:
+            if RECONNECT_RESET_SESSIONS:
+                for share_name in reconnected_share_names:
+                    _reset_share_sessions_after_reconnect(share_name)
+            return True
+        if not _validate_shares_content(new_content):
+            return False
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write(new_content)
+            temp_path = temp_file.name
+        try:
+            subprocess.run(with_privilege(["cp", temp_path, SHARE_CONF]), check=True)
+            subprocess.run(with_privilege(["chmod", "644", SHARE_CONF]), check=True)
+            try:
+                reload_result = subprocess.run(
+                    ["smbcontrol", "all", "reload-config"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if reload_result.returncode != 0:
+                    stderr = (reload_result.stderr or "").strip()
+                    print(
+                        f"Warning: smbcontrol reload-config failed after shares.conf update: {stderr or 'non-zero exit'}"
+                    )
+            except FileNotFoundError:
+                print(
+                    "Warning: smbcontrol not found; shares.conf updated but live reload was skipped"
+                )
+            if RECONNECT_RESET_SESSIONS:
+                for share_name in reconnected_share_names:
+                    _reset_share_sessions_after_reconnect(share_name)
+            return True
+        except Exception as e:
+            set_last_error(str(e))
+            return False
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
+def _reset_share_sessions_after_reconnect(share_name):
+    """Force clients to reopen a share after disk reconnect to avoid stale SMB state."""
+    share_name = normalize_share_name(share_name)
+    if not share_name:
+        return
+
+    try:
+        subprocess.run(
+            with_privilege(["smbcontrol", "smbd", "close-share", share_name]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        print(
+            f'Warning: smbcontrol not found; skipped session refresh for reconnected share "{share_name}"'
+        )
+        return
+    except Exception as e:
+        print(
+            f'Warning: failed to send close-share for reconnected share "{share_name}": {e}'
+        )
+
+    conn_state = get_active_connections()
+    connections = conn_state.get("connections", [])
+    target_connections = [c for c in connections if (c.get("service") or "") == share_name]
+
+    terminated = 0
+    for conn in target_connections:
+        pid = str(conn.get("pid") or "").strip()
+        if not pid:
+            continue
+        ok, _ = terminate_connection(pid)
+        if ok:
+            terminated += 1
+
+    if terminated:
+        print(
+            f'Closed {terminated} stale SMB session(s) for reconnected share "{share_name}"'
+        )
+
+
+def list_managed_shares():
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        result = []
+        for profile in profiles:
+            share = dict(profile.get("share") or {})
+            share["name"] = normalize_share_name(profile.get("name"))
+            share["path"] = profile.get("resolved_path") or share.get("path", "")
+            share["enabled"] = bool(profile.get("enabled", True))
+            share["mode"] = (profile.get("mode") or "path").strip().lower()
+            share["disk_id"] = (profile.get("disk") or {}).get("disk_id", "")
+            share["relative_path"] = profile.get("relative_path", "/")
+            share["runtime_state"] = profile.get("runtime_state", "unknown")
+            share["runtime_note"] = profile.get("runtime_note", "")
+            share.setdefault("comment", "")
+            share.setdefault("browseable", "yes")
+            share.setdefault("read_only", "no")
+            share.setdefault("guest_ok", "no")
+            share.setdefault("valid_users", "")
+            share.setdefault("write_list", "")
+            share.setdefault("create_mask", "0664")
+            share.setdefault("directory_mask", "0775")
+            share.setdefault("force_user", "")
+            share.setdefault("force_group", "")
+            share.setdefault("max_connections", "0")
+            result.append(share)
+        return result
+
+
+def upsert_share_profile(share, mode="path", enabled=True, disk=None, relative_path="/"):
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        profiles = doc.get("shares", [])
+        target_name = normalize_share_name(share.get("name"))
+        normalized_share = dict(share)
+        normalized_share["name"] = target_name
+        profile = None
+        for item in profiles:
+            if normalize_share_name(item.get("name")) == target_name:
+                profile = item
+                break
+        if profile is None:
+            profile = {
+                "name": target_name,
+                "enabled": enabled,
+                "mode": mode,
+                "disk": disk or {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+                "relative_path": relative_path or "/",
+                "resolved_path": normalized_share.get("path", ""),
+                "runtime_state": "unknown",
+                "share": normalized_share,
+            }
+            profiles.append(profile)
+        else:
+            profile["enabled"] = enabled
+            profile["mode"] = mode
+            profile["disk"] = disk or profile.get("disk") or {
+                "disk_id": "",
+                "partuuid": "",
+                "uuid": "",
+                "serial": "",
+                "wwn": "",
+            }
+            profile["relative_path"] = relative_path or profile.get("relative_path") or "/"
+            profile["share"] = normalized_share
+            profile["resolved_path"] = normalized_share.get("path", profile.get("resolved_path", ""))
+        _save_profile_doc(doc)
+    return reconcile_share_profiles_once()
+
+
+def set_share_enabled(name, enabled):
+    with _PROFILE_LOCK:
+        ensure_share_profiles_initialized()
+        doc = _load_profile_doc()
+        target_name = normalize_share_name(name)
+        changed = False
+        for profile in doc.get("shares", []):
+            if normalize_share_name(profile.get("name")) == target_name:
+                profile["enabled"] = bool(enabled)
+                changed = True
+                break
+        if not changed:
+            set_last_error(f'Share "{name}" not found in profile registry')
+            return False
+        _save_profile_doc(doc)
+    return reconcile_share_profiles_once()
+
+
+def _disk_reconciler_loop():
+    print(
+        f"Disk reconciler started (enabled={RECONCILE_ENABLED}, interval={RECONCILE_INTERVAL_SECONDS}s)"
+    )
+    while True:
+        try:
+            reconcile_share_profiles_once()
+        except Exception as e:
+            print(f"Disk reconciler error: {e}")
+        time.sleep(RECONCILE_INTERVAL_SECONDS)
+
+
+def start_disk_reconciler():
+    global _RECONCILER_THREAD
+    if not RECONCILE_ENABLED:
+        print("Disk reconciler disabled by SAMBA_MANAGER_DISK_RECONCILE_ENABLED=0")
+        return
+    if _RECONCILER_THREAD and _RECONCILER_THREAD.is_alive():
+        return
+    ensure_share_profiles_initialized()
+    _RECONCILER_THREAD = threading.Thread(
+        target=_disk_reconciler_loop, name="disk-reconciler", daemon=True
+    )
+    _RECONCILER_THREAD.start()
+
+
+def _extract_plain_users(principal_string):
+    items = [item.strip() for item in re.split(r"[\s,]+", principal_string or "") if item.strip()]
+    return [item for item in items if not item.startswith("@")]
+
+
+def _user_can_write_path(username, path):
+    try:
+        user_info = pwd.getpwnam(username)
+    except KeyError:
+        return False
+
+    try:
+        st = os.stat(path)
+    except Exception:
+        return False
+
+    user_uid = user_info.pw_uid
+    user_gid = user_info.pw_gid
+    user_groups = set()
+    try:
+        user_groups = {g.gr_gid for g in grp.getgrall() if username in g.gr_mem}
+    except Exception:
+        user_groups = set()
+    user_groups.add(user_gid)
+
+    if st.st_uid == user_uid and (st.st_mode & 0o200):
+        return True
+    if st.st_gid in user_groups and (st.st_mode & 0o020):
+        return True
+    if st.st_mode & 0o002:
+        return True
+    return False
+
+
+def apply_share_access_policy(share):
+    """Auto-apply a safe access policy for external disks without mutating FS ownership.
+
+    Modes:
+    - auto (default): keep force fields empty when user can write; fallback to force user=root.
+    - manual: keep user-provided force user/group unchanged.
+    """
+    mode = (share.get("access_mode") or os.environ.get("SAMBA_MANAGER_SHARE_ACCESS_MODE", "auto")).strip().lower()
+    if mode not in {"auto", "manual"}:
+        mode = "auto"
+    share["access_mode"] = mode
+
+    if mode == "manual":
+        return share, ""
+
+    # In auto mode, explicit force values mean "manual intent".
+    if share.get("force_user") or share.get("force_group"):
+        return share, ""
+
+    if str(share.get("read_only", "no")).lower() == "yes":
+        return share, ""
+
+    path = (share.get("path") or "").strip()
+    if not path:
+        return share, ""
+
+    candidate_users = []
+    candidate_users.extend(_extract_plain_users(share.get("write_list", "")))
+    candidate_users.extend(_extract_plain_users(share.get("valid_users", "")))
+    # Preserve order + uniq
+    candidate_users = list(dict.fromkeys(candidate_users))
+
+    if any(_user_can_write_path(user, path) for user in candidate_users):
+        return share, ""
+
+    # Fallback for host-mounted disks with foreign UID ownership.
+    share["force_user"] = "root"
+    if not share.get("force_group"):
+        share["force_group"] = ""
+    return share, (
+        "Auto access mode enabled: path is not writable by selected Samba users, "
+        "so `force user = root` was applied without changing disk ownership."
+    )
 
 
 def load_shares():
@@ -707,6 +1546,7 @@ def load_shares():
                     "write list": "write_list",
                     "create mask": "create_mask",
                     "directory mask": "directory_mask",
+                    "force user": "force_user",
                     "force group": "force_group",
                     "max connections": "max_connections",
                 }
@@ -725,9 +1565,10 @@ def load_shares():
                     "guest_ok": "no",
                     "valid_users": "",
                     "write_list": "",
-                    "create_mask": "0775",
+                    "create_mask": "0664",
                     "directory_mask": "0775",
-                    "force_group": "smbusers",
+                    "force_user": "",
+                    "force_group": "",
                     "max_connections": "0",
                 }
 
@@ -784,6 +1625,7 @@ def load_shares():
                         "write list": "write_list",
                         "create mask": "create_mask",
                         "directory mask": "directory_mask",
+                        "force user": "force_user",
                         "force group": "force_group",
                         "max connections": "max_connections",
                     }
@@ -822,6 +1664,7 @@ def load_shares():
                         "write list": "write_list",
                         "create mask": "create_mask",
                         "directory mask": "directory_mask",
+                        "force user": "force_user",
                         "force group": "force_group",
                         "max connections": "max_connections",
                     }
@@ -840,9 +1683,10 @@ def load_shares():
                         "guest_ok": "no",
                         "valid_users": "",
                         "write_list": "",
-                        "create_mask": "0775",
+                        "create_mask": "0664",
                         "directory_mask": "0775",
-                        "force_group": "smbusers",
+                        "force_user": "",
+                        "force_group": "",
                         "max_connections": "0",
                     }
 
@@ -927,6 +1771,7 @@ def load_shares():
 
 def save_shares(shares):
     try:
+        set_last_error("")
         print(f"Saving {len(shares)} shares to {SHARE_CONF}")
 
         # Map our normalized keys back to Samba config keys
@@ -935,59 +1780,63 @@ def save_shares(shares):
             "comment": "comment",
             "browseable": "browseable",
             "read_only": "read only",
-            "guest ok": "guest ok",
+            "guest_ok": "guest ok",
             "valid_users": "valid users",
-            "write list": "write list",
+            "write_list": "write list",
             "create_mask": "create mask",
-            "directory mask": "directory mask",
+            "directory_mask": "directory mask",
+            "force_user": "force user",
             "force_group": "force group",
             "max_connections": "max connections",
         }
-
-        # These fields should always be included in the config, even if empty
-        required_fields = [
-            "path",
-            "valid_users",
-            "write_list",
-            "create_mask",
-            "directory_mask",
-        ]
+        allowed_fields = set(reverse_key_mapping.keys())
 
         # Create temporary file with new configuration
-        import tempfile
-
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
             temp_file.write("# Samba shares configuration\n\n")
             for s in shares:
                 temp_file.write(f"[{s['name']}]\n")
-
-                # First write required fields
-                for our_key in required_fields:
-                    if our_key in s:
-                        samba_key = reverse_key_mapping.get(our_key, our_key)
-                        temp_file.write(f"   {samba_key} = {s[our_key]}\n")
-
-                # Then write the rest of the fields
-                for our_key, value in s.items():
-                    if (
-                        our_key != "name" and our_key not in required_fields
-                    ):  # Skip the name and required fields
-                        if our_key in reverse_key_mapping:
-                            samba_key = reverse_key_mapping[our_key]
-                            temp_file.write(f"   {samba_key} = {value}\n")
-                        else:
-                            # For any keys not in our mapping, write them as-is
-                            temp_file.write(f"   {our_key} = {value}\n")
+                for our_key in reverse_key_mapping:
+                    value = str(s.get(our_key, "")).strip()
+                    if not value:
+                        continue
+                    samba_key = reverse_key_mapping[our_key]
+                    temp_file.write(f"   {samba_key} = {value}\n")
 
                 temp_file.write("\n")
             temp_path = temp_file.name
             print(f"Created temporary file at {temp_path}")
 
+        # Validate before replacing real shares.conf
+        testparm_cmd = with_privilege(["testparm", "-s"])
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_smb:
+            include_path = temp_path
+            temp_smb.write("[global]\n")
+            temp_smb.write(f"   include = {include_path}\n\n")
+            temp_smb_path = temp_smb.name
+
+        testparm_exists = subprocess.run(
+            ["which", "testparm"], capture_output=True, text=True, check=False
+        )
+        if testparm_exists.returncode == 0:
+            validate_result = subprocess.run(
+                testparm_cmd + [temp_smb_path], capture_output=True, text=True, check=False
+            )
+            output = (validate_result.stdout or "") + "\n" + (validate_result.stderr or "")
+            if validate_result.returncode != 0 or "Unknown parameter encountered" in output:
+                os.unlink(temp_path)
+                os.unlink(temp_smb_path)
+                set_last_error(output.strip())
+                print(f"Share config validation failed: {output}")
+                return False
+        os.unlink(temp_smb_path)
+
         # Backup original shares file if it exists
         if os.path.exists(SHARE_CONF):
             try:
                 subprocess.run(
-                    ["sudo", "cp", SHARE_CONF, f"{SHARE_CONF}.bak"], check=True
+                    with_privilege(["cp", SHARE_CONF, f"{SHARE_CONF}.bak"]), check=True
                 )
                 print(f"Backed up {SHARE_CONF} to {SHARE_CONF}.bak")
             except Exception as e:
@@ -996,9 +1845,9 @@ def save_shares(shares):
         # Use sudo to copy the temporary file to the correct location
         try:
             print(f"Copying temporary file to {SHARE_CONF}")
-            subprocess.run(["sudo", "cp", temp_path, SHARE_CONF], check=True)
+            subprocess.run(with_privilege(["cp", temp_path, SHARE_CONF]), check=True)
             # Set proper permissions
-            subprocess.run(["sudo", "chmod", "644", SHARE_CONF], check=True)
+            subprocess.run(with_privilege(["chmod", "644", SHARE_CONF]), check=True)
 
             # If in production mode, also update the local copy for reference
             if not DEV_MODE:
@@ -1013,6 +1862,7 @@ def save_shares(shares):
             print(f"Successfully copied configuration to {SHARE_CONF}")
         except Exception as e:
             print(f"Error copying shares file: {e}")
+            set_last_error(str(e))
             return False
 
         # Check if there are any shares defined directly in the main config
@@ -1024,7 +1874,7 @@ def save_shares(shares):
                 if not DEV_MODE:
                     system_conf = "/etc/samba/smb.conf"
                     result = subprocess.run(
-                        ["sudo", "cat", system_conf],
+                        with_privilege(["cat", system_conf]),
                         capture_output=True,
                         text=True,
                         check=True,
@@ -1074,13 +1924,13 @@ def save_shares(shares):
                         if not DEV_MODE:
                             system_conf = "/etc/samba/smb.conf"
                             subprocess.run(
-                                ["sudo", "cp", system_conf, f"{system_conf}.bak"],
+                                with_privilege(["cp", system_conf, f"{system_conf}.bak"]),
                                 check=True,
                             )
                             print(f"Backed up {system_conf} to {system_conf}.bak")
                         else:
                             subprocess.run(
-                                ["sudo", "cp", SMB_CONF, f"{SMB_CONF}.bak"], check=True
+                                with_privilege(["cp", SMB_CONF, f"{SMB_CONF}.bak"]), check=True
                             )
                             print(f"Backed up {SMB_CONF} to {SMB_CONF}.bak")
                     except Exception as e:
@@ -1090,7 +1940,7 @@ def save_shares(shares):
                     if not DEV_MODE:
                         system_conf = "/etc/samba/smb.conf"
                         subprocess.run(
-                            ["sudo", "cp", temp_path, system_conf], check=True
+                            with_privilege(["cp", temp_path, system_conf]), check=True
                         )
                         # Also update local copy
                         try:
@@ -1101,15 +1951,15 @@ def save_shares(shares):
                                 f"Warning: Could not update local copy of main config: {e}"
                             )
                     else:
-                        subprocess.run(["sudo", "cp", temp_path, SMB_CONF], check=True)
+                        subprocess.run(with_privilege(["cp", temp_path, SMB_CONF]), check=True)
 
                     # Set proper permissions
                     if not DEV_MODE:
                         subprocess.run(
-                            ["sudo", "chmod", "644", system_conf], check=True
+                            with_privilege(["chmod", "644", system_conf]), check=True
                         )
                     else:
-                        subprocess.run(["sudo", "chmod", "644", SMB_CONF], check=True)
+                        subprocess.run(with_privilege(["chmod", "644", SMB_CONF]), check=True)
 
                     os.unlink(temp_path)  # Remove the temp file
                     print(f"Successfully removed shares from main config")
@@ -1122,7 +1972,7 @@ def save_shares(shares):
             if not DEV_MODE:
                 system_conf = "/etc/samba/smb.conf"
                 result = subprocess.run(
-                    ["sudo", "cat", system_conf],
+                    with_privilege(["cat", system_conf]),
                     capture_output=True,
                     text=True,
                     check=True,
@@ -1134,25 +1984,22 @@ def save_shares(shares):
                     content = f.read()
                 include_path = SHARE_CONF
 
-            if f"include = {include_path}" not in content:
-                print(f"Adding include directive to main config")
-                # Create a temporary file with updated content
+            sections = parse_config_content(content)
+            if "global" not in sections:
+                sections["global"] = {}
+            sections["global"]["include"] = include_path
+
+            new_content = render_config_sections(sections, include_path=include_path)
+            if new_content != content:
+                print(f"Adding/updating include directive in main config")
                 with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
-                    if "[global]" in content:
-                        new_content = content.replace(
-                            "[global]", f"[global]\n   include = {include_path}"
-                        )
-                    else:
-                        new_content = (
-                            f"[global]\n   include = {include_path}\n\n{content}"
-                        )
                     temp_file.write(new_content)
                     temp_path = temp_file.name
 
                 # Use sudo to copy the temporary file to the correct location
                 if not DEV_MODE:
                     system_conf = "/etc/samba/smb.conf"
-                    subprocess.run(["sudo", "cp", temp_path, system_conf], check=True)
+                    subprocess.run(with_privilege(["cp", temp_path, system_conf]), check=True)
                     # Also update local copy
                     try:
                         subprocess.run(["cp", temp_path, "./smb.conf"], check=True)
@@ -1164,40 +2011,53 @@ def save_shares(shares):
                             f"Warning: Could not update local copy of main config: {e}"
                         )
                 else:
-                    subprocess.run(["sudo", "cp", temp_path, SMB_CONF], check=True)
+                    subprocess.run(with_privilege(["cp", temp_path, SMB_CONF]), check=True)
 
                 # Set proper permissions
                 if not DEV_MODE:
-                    subprocess.run(["sudo", "chmod", "644", system_conf], check=True)
+                    subprocess.run(with_privilege(["chmod", "644", system_conf]), check=True)
                 else:
-                    subprocess.run(["sudo", "chmod", "644", SMB_CONF], check=True)
+                    subprocess.run(with_privilege(["chmod", "644", SMB_CONF]), check=True)
 
                 os.unlink(temp_path)  # Remove the temp file
-                print(f"Added include directive to main config")
+                print(f"Updated include directive placement in main config")
         except Exception as e:
             print(f"Warning: Could not update include directive: {e}")
 
         # Validate configuration before restarting
         try:
-            validate_cmd = ["sudo", "testparm", "-s"]
+            validate_cmd = with_privilege(["testparm", "-s"])
             validate_result = subprocess.run(
                 validate_cmd, capture_output=True, text=True, check=False
             )
-            if validate_result.returncode != 0:
-                print(
-                    f"Warning: Samba configuration validation failed: {validate_result.stderr}"
-                )
-                # Continue anyway as testparm might have warnings but still be valid
+            validate_output = (validate_result.stdout or "") + "\n" + (
+                validate_result.stderr or ""
+            )
+            if validate_result.returncode != 0 or testparm_has_warnings_or_service_section_error(
+                validate_output
+            ):
+                print(f"Samba configuration validation failed: {validate_output}")
+                set_last_error(validate_output)
+                return False
         except Exception as e:
             print(f"Warning: Could not validate configuration: {e}")
 
-        # Restart Samba service
-        print("Restarting Samba service")
-        result = restart_samba_service()
-        print(f"Samba service restart {'successful' if result else 'failed'}")
-        return result
+        # Reload Samba in-place; do not crash if reload fails.
+        reload_result = subprocess.run(
+            ["smbcontrol", "all", "reload-config"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if reload_result.returncode != 0:
+            set_last_error(
+                f"Configuration saved, but reload failed: {reload_result.stderr.strip()}"
+            )
+            return True
+        return True
     except Exception as e:
         print(f"Error saving shares: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1228,8 +2088,10 @@ def add_or_update_share(new_share):
             "guest_ok": "no",
             "valid_users": "",
             "write_list": "",
-            "create_mask": "0775",
+            "create_mask": "0664",
             "directory_mask": "0775",
+            "force_user": "",
+            "force_group": "",
             "max_connections": "0",
         }
 
@@ -1239,30 +2101,24 @@ def add_or_update_share(new_share):
                 print(f"Using default value for {key}: {value}")
 
         print(f"Processing share with path: {new_share['path']}")
+        share_mode = (new_share.get("mode") or "path").strip().lower()
 
-        # Ensure the share directory exists with proper permissions
-        if not create_share_directory(new_share["name"], new_share["path"]):
-            print(
-                f"Failed to create or set permissions on share directory: {new_share['path']}"
-            )
-            return False
+        # Ensure the share directory exists with proper permissions for classic path mode.
+        if share_mode == "path":
+            if not create_share_directory(new_share["name"], new_share["path"]):
+                print(
+                    f"Failed to create or set permissions on share directory: {new_share['path']}"
+                )
+                return False
 
-        # Load existing shares
-        shares = load_shares()
-
-        # Check if we're updating an existing share
-        for idx, s in enumerate(shares):
-            if s["name"] == new_share["name"]:
-                print(f"Updating existing share: {new_share['name']}")
-                shares[idx] = new_share
-                break
-        else:
-            # Share doesn't exist, add it
-            print(f"Adding new share: {new_share['name']}")
-            shares.append(new_share)
-
-        # Save the updated shares
-        result = save_shares(shares)
+        # Profile-backed persistence + reconcile
+        result = upsert_share_profile(
+            share=new_share,
+            mode=(new_share.get("mode") or "path"),
+            enabled=bool(new_share.get("enabled", True)),
+            disk=new_share.get("disk"),
+            relative_path=new_share.get("relative_path", "/"),
+        )
         if result:
             print(f"Successfully saved share: {new_share['name']}")
         else:
@@ -1277,30 +2133,99 @@ def add_or_update_share(new_share):
 def delete_share(name):
     """Delete a Samba share by name and restart the service"""
     try:
-        print(f"Deleting share: {name}")
-        shares = load_shares()
-        original_count = len(shares)
-
-        # Filter out the share to delete
-        new_shares = [s for s in shares if s["name"] != name]
-
-        if len(new_shares) == original_count:
-            print(f"Warning: Share '{name}' not found in configuration")
+        target_name = unicodedata.normalize("NFC", (name or "").strip())
+        print(f"Deleting share: {target_name}")
+        if not target_name:
+            set_last_error("Share name is empty")
             return False
 
-        print(f"Removed share '{name}' from configuration")
+        with _PROFILE_LOCK:
+            ensure_share_profiles_initialized()
+            doc = _load_profile_doc()
+            profiles = doc.get("shares", [])
+            kept = []
+            removed = False
+            for profile in profiles:
+                if normalize_share_name(profile.get("name")) == target_name:
+                    removed = True
+                    continue
+                kept.append(profile)
+            if not removed:
+                print(f"Warning: Share '{target_name}' not found in profile registry")
+                return False
+            doc["shares"] = kept
+            _save_profile_doc(doc)
 
-        # Save the updated shares and restart Samba
-        result = save_shares(new_shares)
-        if result:
-            print(f"Successfully deleted share '{name}' and restarted Samba")
-        else:
-            print(f"Failed to save configuration after deleting share '{name}'")
+        if not reconcile_share_profiles_once():
+            return False
 
-        return result
+        # Post-check: verify share is really gone, otherwise force-remove its section.
+        remaining = [
+            s
+            for s in load_shares()
+            if unicodedata.normalize("NFC", str(s.get("name", "")).strip()) == target_name
+        ]
+        if remaining:
+            print(
+                f"Share '{target_name}' still present after save; forcing section removal from config files"
+            )
+            _force_remove_share_sections(target_name)
+
+            remaining_after_force = [
+                s
+                for s in load_shares()
+                if unicodedata.normalize("NFC", str(s.get("name", "")).strip()) == target_name
+            ]
+            if remaining_after_force:
+                set_last_error(
+                    f"Share '{target_name}' still present after forced cleanup"
+                )
+                return False
+
+        print(f"Successfully deleted share '{target_name}' and reloaded Samba")
+        return True
     except Exception as e:
         print(f"Error deleting share: {e}")
+        set_last_error(str(e))
         return False
+
+def _force_remove_share_sections(share_name):
+    """Force-remove share section from SHARE_CONF and SMB_CONF by section name."""
+    target_name = unicodedata.normalize("NFC", (share_name or "").strip())
+    if not target_name:
+        return
+
+    for conf_path in [SHARE_CONF, SMB_CONF]:
+        try:
+            if not os.path.exists(conf_path):
+                continue
+            with open(conf_path, "r") as f:
+                content = f.read()
+            sections = parse_config_content(content)
+            found = False
+            updated = {}
+            for sec_name, sec_data in sections.items():
+                if unicodedata.normalize("NFC", sec_name.strip()) == target_name:
+                    found = True
+                    continue
+                updated[sec_name] = sec_data
+            if not found:
+                continue
+
+            include_path = None
+            if "global" in updated:
+                include_path = updated["global"].get("include")
+            rendered = render_config_sections(updated, include_path=include_path)
+
+            with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+                tmp.write(rendered)
+                tmp_path = tmp.name
+            subprocess.run(with_privilege(["cp", tmp_path, conf_path]), check=True)
+            subprocess.run(with_privilege(["chmod", "644", conf_path]), check=True)
+            os.unlink(tmp_path)
+            print(f"Forced section cleanup in {conf_path} for share '{target_name}'")
+        except Exception as e:
+            print(f"Warning: force cleanup failed for {conf_path}: {e}")
 
 
 def list_system_users():
@@ -1727,28 +2652,73 @@ def add_samba_user(username, password, create_system_user=False):
         return True
 
     try:
-        # Check if system user exists
-        check_user = subprocess.run(
-            ["id", username], capture_output=True, text=True, check=False
-        )
-        user_exists = check_user.returncode == 0
+        set_last_error("")
 
-        # Create system user if requested and doesn't exist
-        if not user_exists and create_system_user:
+        def linux_user_exists(target_user):
+            return (
+                subprocess.run(
+                    ["getent", "passwd", target_user],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).returncode
+                == 0
+            )
+
+        def validate_passdb_uid_integrity():
+            ok, output = run_command(with_privilege(["pdbedit", "-L"]))
+            if not ok:
+                return True
+            for line in output.splitlines():
+                if ":4294967295:" in line:
+                    set_last_error(
+                        "Samba passdb contains invalid UID 4294967295. "
+                        "Fix system user UID/GID mapping before enabling Samba user."
+                    )
+                    return False
+            return True
+
+        def samba_user_exists(target_user):
+            probe = subprocess.run(
+                with_privilege(["pdbedit", "-L", "-u", target_user]),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return probe.returncode == 0
+
+        # Ensure Linux user exists before any smbpasswd operation.
+        user_exists = linux_user_exists(username)
+        if not user_exists:
             print(f"Creating system user: {username}")
+            create_cmd = with_privilege(["useradd", "-m", "-s", "/bin/bash"])
+
+            # Stable UID/GID for predictable Docker/CasaOS behavior.
+            uid = os.environ.get("SAMBA_DEFAULT_UID", "").strip()
+            gid = os.environ.get("SAMBA_DEFAULT_GID", "").strip()
+
+            if uid.isdigit():
+                create_cmd.extend(["-u", uid])
+            if gid.isdigit():
+                create_cmd.extend(["-g", gid])
+            else:
+                create_cmd.append("-U")
+            create_cmd.append(username)
+
             create_user = subprocess.run(
-                ["sudo", "useradd", "-m", "-s", "/bin/bash", username],
+                create_cmd,
                 capture_output=True,
                 text=True,
                 check=False,
             )
             if create_user.returncode != 0:
                 print(f"Failed to create system user: {create_user.stderr}")
+                set_last_error(create_user.stderr.strip())
                 return False
 
             # Set system password
             set_pass = subprocess.Popen(
-                ["sudo", "chpasswd"],
+                with_privilege(["chpasswd"]),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1757,7 +2727,15 @@ def add_samba_user(username, password, create_system_user=False):
             stdout, stderr = set_pass.communicate(input=f"{username}:{password}")
             if set_pass.returncode != 0:
                 print(f"Failed to set system password: {stderr}")
+                set_last_error(stderr.strip())
                 return False
+
+        user_exists = linux_user_exists(username)
+        if not user_exists:
+            set_last_error(
+                "System user does not exist and could not be created."
+            )
+            return False
 
         # Create smbusers group if it doesn't exist
         check_group = subprocess.run(
@@ -1766,7 +2744,7 @@ def add_samba_user(username, password, create_system_user=False):
         if check_group.returncode != 0:
             print("Creating smbusers group")
             create_group = subprocess.run(
-                ["sudo", "groupadd", "smbusers"],
+                with_privilege(["groupadd", "smbusers"]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1778,7 +2756,7 @@ def add_samba_user(username, password, create_system_user=False):
         if user_exists or create_system_user:
             print(f"Adding {username} to smbusers group")
             add_to_group = subprocess.run(
-                ["sudo", "usermod", "-aG", "smbusers", username],
+                with_privilege(["usermod", "-aG", "smbusers", username]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1786,26 +2764,39 @@ def add_samba_user(username, password, create_system_user=False):
             if add_to_group.returncode != 0:
                 print(f"Failed to add user to smbusers group: {add_to_group.stderr}")
 
+        if not validate_passdb_uid_integrity():
+            return False
+
         # Add Samba user
-        print(f"Creating Samba user: {username}")
-        process = subprocess.Popen(
-            ["sudo", "smbpasswd", "-s", "-a", username],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        if samba_user_exists(username):
+            print(f"Samba user {username} exists, resetting password")
+            process = subprocess.Popen(
+                with_privilege(["smbpasswd", "-s", username]),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        else:
+            print(f"Creating Samba user: {username}")
+            process = subprocess.Popen(
+                with_privilege(["smbpasswd", "-s", "-a", username]),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
         stdout, stderr = process.communicate(input=f"{password}\n{password}\n")
-
         if process.returncode != 0:
-            print(f"Failed to create Samba user: {stderr}")
+            print(f"Failed to configure Samba user: {stderr}")
+            set_last_error(stderr.strip())
             return False
 
         # Enable the Samba user
         print("Enabling Samba user")
         enable = subprocess.run(
-            ["sudo", "smbpasswd", "-e", username],
+            with_privilege(["smbpasswd", "-e", username]),
             capture_output=True,
             text=True,
             check=False,
@@ -1813,11 +2804,13 @@ def add_samba_user(username, password, create_system_user=False):
 
         if enable.returncode != 0:
             print(f"Failed to enable Samba user: {enable.stderr}")
+            set_last_error(enable.stderr.strip())
             return False
 
         return True
     except Exception as e:
         print(f"Error adding Samba user: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1828,16 +2821,24 @@ def remove_samba_user(username, delete_system_user=False):
         return True
 
     try:
+        set_last_error("")
         # Delete Samba user
-        success, _ = run_command(["sudo", "smbpasswd", "-x", username])
+        success, err = run_command(["sudo", "smbpasswd", "-x", username])
+        if not success:
+            set_last_error(err)
+            return False
 
         # Delete system user if requested
         if delete_system_user:
-            run_command(["sudo", "userdel", "-r", username])
+            sys_success, sys_err = run_command(["sudo", "userdel", "-r", username])
+            if not sys_success:
+                set_last_error(sys_err)
+                return False
 
         return success
     except Exception as e:
         print(f"Error removing Samba user: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -1876,12 +2877,18 @@ def reset_samba_password(username, password):
         return True
 
     try:
-        success, _ = run_command(
+        success, err = run_command(
             ["sudo", "smbpasswd", "-s", username], f"{password}\n{password}\n"
         )
+        if not success:
+            set_last_error(err)
+            return False
+        # Keep user active after password reset
+        run_command(["sudo", "smbpasswd", "-e", username])
         return success
     except Exception as e:
         print(f"Error resetting Samba password: {e}")
+        set_last_error(str(e))
         return False
 
 
@@ -2067,6 +3074,7 @@ def get_samba_installation_status():
         "installed": False,
         "running": False,
         "configured": False,
+        "config_exists": False,
         "shares": [],
         "users": [],
     }
@@ -2085,6 +3093,7 @@ def get_samba_installation_status():
 
         # Check if Samba is configured
         status["configured"] = os.path.exists(ACTUAL_SMB_CONF)
+        status["config_exists"] = status["configured"]
 
         # Get shares
         status["shares"] = load_shares()
@@ -2292,7 +3301,7 @@ def terminate_connection(pid):
 
         # Verify that the PID belongs to a Samba process
         result = subprocess.run(
-            ["sudo", "ps", "-p", pid, "-o", "comm="],
+            with_privilege(["ps", "-p", pid, "-o", "comm="]),
             capture_output=True,
             text=True,
             check=False,
@@ -2308,7 +3317,7 @@ def terminate_connection(pid):
         try:
             # Get smbstatus output
             status_result = subprocess.run(
-                ["sudo", "smbstatus"], capture_output=True, text=True, check=False
+                with_privilege(["smbstatus"]), capture_output=True, text=True, check=False
             )
 
             if status_result.returncode == 0:
@@ -2326,19 +3335,19 @@ def terminate_connection(pid):
 
         # Try to kill the process with SIGTERM first
         kill_result = subprocess.run(
-            ["sudo", "kill", "-TERM", pid], capture_output=True, text=True, check=False
+            with_privilege(["kill", "-TERM", pid]), capture_output=True, text=True, check=False
         )
 
         # Check if the process is still running
         check_result = subprocess.run(
-            ["sudo", "ps", "-p", pid], capture_output=True, text=True, check=False
+            with_privilege(["ps", "-p", pid]), capture_output=True, text=True, check=False
         )
 
         # If process still exists, try SIGKILL
         if check_result.returncode == 0:
             print(f"Process {pid} still running after SIGTERM, trying SIGKILL")
             kill_result = subprocess.run(
-                ["sudo", "kill", "-KILL", pid],
+                with_privilege(["kill", "-KILL", pid]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2350,7 +3359,7 @@ def terminate_connection(pid):
                 print(f"Attempting to force disconnect machine: {machine_name}")
                 # Use smbcontrol to force disconnect the client
                 smbcontrol_result = subprocess.run(
-                    ["sudo", "smbcontrol", "smbd", "close-share", machine_name],
+                    with_privilege(["smbcontrol", "smbd", "close-share", machine_name]),
                     capture_output=True,
                     text=True,
                     check=False,
@@ -2362,7 +3371,7 @@ def terminate_connection(pid):
 
         # Final check if the process is still running
         final_check = subprocess.run(
-            ["sudo", "ps", "-p", pid], capture_output=True, text=True, check=False
+            with_privilege(["ps", "-p", pid]), capture_output=True, text=True, check=False
         )
 
         if final_check.returncode == 0:
@@ -2388,7 +3397,7 @@ def terminate_connection_by_machine(machine):
             print(f"Attempting to force disconnect machine: {machine}")
             # Use smbcontrol to force disconnect the client
             smbcontrol_result = subprocess.run(
-                ["sudo", "smbcontrol", "smbd", "close-share", machine],
+                with_privilege(["smbcontrol", "smbd", "close-share", machine]),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2407,7 +3416,7 @@ def terminate_connection_by_machine(machine):
         try:
             # Get smbstatus output
             status_result = subprocess.run(
-                ["sudo", "smbstatus"], capture_output=True, text=True, check=False
+                with_privilege(["smbstatus"]), capture_output=True, text=True, check=False
             )
 
             if status_result.returncode == 0:
@@ -2433,7 +3442,7 @@ def terminate_connection_by_machine(machine):
                 # Kill all PIDs associated with this machine
                 for pid in pids_to_kill:
                     print(f"Killing PID {pid} associated with machine {machine}")
-                    subprocess.run(["sudo", "kill", "-KILL", pid], check=False)
+                    subprocess.run(with_privilege(["kill", "-KILL", pid]), check=False)
         except Exception as e:
             print(f"Error killing PIDs for machine {machine}: {str(e)}")
 
@@ -2448,7 +3457,7 @@ def get_active_connections():
     try:
         # Use smbstatus to get active connections
         result = subprocess.run(
-            ["sudo", "smbstatus"], capture_output=True, text=True, check=True
+            with_privilege(["smbstatus"]), capture_output=True, text=True, check=True
         )
 
         output = result.stdout.strip()
@@ -2607,6 +3616,66 @@ def get_active_connections():
             "processes": [],
             "connections": [],
         }
+
+
+def prepare_share_for_unplug(share_name):
+    """Terminate active SMB sessions for a share before disk unplug/unmount."""
+    if not share_name:
+        return False, "Share name is required"
+
+    # First ask smbd to close this specific share for all clients.
+    try:
+        subprocess.run(
+            with_privilege(["smbcontrol", "smbd", "close-share", share_name]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        pass
+
+    conn_state = get_active_connections()
+    connections = conn_state.get("connections", [])
+    share_connections = [c for c in connections if (c.get("service") or "") == share_name]
+
+    if not share_connections:
+        return True, f'No active SMB clients on "{share_name}". Safe to unmount if no local processes use the disk.'
+
+    terminated = 0
+    failures = []
+    seen_pids = set()
+
+    for conn in share_connections:
+        pid = str(conn.get("pid") or "").strip()
+        if not pid or pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        ok, msg = terminate_connection(pid)
+        if ok:
+            terminated += 1
+        else:
+            failures.append(msg)
+
+    # Give smbd a short moment to release handles and refresh state.
+    time.sleep(0.6)
+    remaining = [
+        c for c in get_active_connections().get("connections", []) if (c.get("service") or "") == share_name
+    ]
+    if remaining:
+        return (
+            False,
+            f'Closed {terminated} connection(s), but {len(remaining)} still active on "{share_name}". '
+            "Try again in a few seconds or disconnect clients manually from Connections page.",
+        )
+
+    if failures:
+        return (
+            True,
+            f'Closed {terminated} connection(s) on "{share_name}". '
+            "Some disconnect attempts reported warnings, but no active sessions remain.",
+        )
+
+    return True, f'Closed {terminated} connection(s) on "{share_name}". You can now unmount/eject the disk.'
 
 
 def get_share_usage_stats():

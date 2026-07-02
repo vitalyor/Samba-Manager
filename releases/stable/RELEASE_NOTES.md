@@ -1,10 +1,10 @@
-# Samba Manager v1.3.0 Release Notes
+# Samba Manager v1.3.1 Release Notes
 
-**Release Date**: 2026-01-24
+**Release Date**: 2026-07-02
 
 ## Overview
 
-This release of Samba Manager includes all features and improvements up to version 1.3.0.
+This release of Samba Manager includes all features and improvements up to version 1.3.1.
 
 ## What's Included
 
@@ -20,8 +20,8 @@ This release package includes:
 ### Quick Start
 ```bash
 # Extract the package
-tar -xzf samba-manager-1.3.0.tar.gz
-cd samba-manager-1.3.0
+tar -xzf samba-manager-1.3.1.tar.gz
+cd samba-manager-1.3.1
 
 # Run the installation
 sudo ./install.sh
@@ -29,8 +29,8 @@ sudo ./install.sh
 
 ### Docker Deployment
 ```bash
-docker build -t samba-manager:1.3.0 .
-docker run -p 5000:5000 -v /etc/samba:/etc/samba samba-manager:1.3.0
+docker build -t samba-manager:1.3.1 .
+docker run -p 5000:5000 -v /etc/samba:/etc/samba samba-manager:1.3.1
 ```
 
 ## System Requirements
@@ -86,8 +86,8 @@ If upgrading from a previous version:
 
 2. Extract and install the new version:
    ```bash
-   tar -xzf samba-manager-1.3.0.tar.gz
-   cd samba-manager-1.3.0
+   tar -xzf samba-manager-1.3.1.tar.gz
+   cd samba-manager-1.3.1
    sudo ./install.sh
    ```
 
@@ -112,5 +112,5 @@ This software is released under the MIT License. See the LICENSE file for detail
 
 ---
 
-**Download**: https://github.com/lyarinet/samba-manager/releases/tag/v1.3.0
+**Download**: https://github.com/lyarinet/samba-manager/releases/tag/v1.3.1
 

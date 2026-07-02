@@ -63,7 +63,7 @@ docker-compose up
 
 #### Option B: Using Docker Hub (Pre-built)
 ```bash
-docker run -d -p 5000:5000 lyarinet/samba-manager:latest
+docker run -d -p 5000:5000 lyarinet/samba-manager:1.3.0
 ```
 
 **Docker Hub**: https://hub.docker.com/r/lyarinet/samba-manager
@@ -86,12 +86,6 @@ chmod +x install_with_auth.sh
 # Run it with sudo
 sudo ./install_with_auth.sh
 ```
-
-This script will:
-- Prompt you for GitHub credentials if needed
-- Try multiple repository names
-- Allow you to enter a custom repository URL if needed
-- Handle all installation steps automatically
 
 #### Option 2: One-line Installation
 
@@ -220,6 +214,31 @@ docker-compose up
 ```
 
 For more details, see the [releases/docker/](releases/docker/) directory.
+
+### External disks & mount propagation
+
+If external disks are mounted on the host **after** the container starts (e.g. via
+`devmon`/`udevil` into `/media/devmon/<disk>`), the bind mount **must** use `rslave`
+propagation — otherwise those mounts never become visible inside the container and the
+share opens empty (or stays "Waiting Disk") until the container is restarted:
+
+```yaml
+volumes:
+  - type: bind
+    source: /media/devmon
+    target: /shares
+    bind:
+      propagation: rslave
+```
+
+Fallbacks if you can't change propagation: bind the specific mountpoint directly
+(`/media/devmon/<disk>:/shares/<disk>:rslave`), or restart the container after mounting.
+Samba Manager detects the `udevil` mount stub and keeps such shares as "Waiting Disk"
+(with a Diagnose button) instead of publishing an empty share; it auto-recovers once the
+real mount becomes visible.
+
+Note: the reconciler writes to `/etc/samba/shares.conf` and `share_profiles.json`, so if
+you bind-mount `/etc/samba` from the host do **not** mount it read-only (`:ro`).
 
 ## Release Management System
 

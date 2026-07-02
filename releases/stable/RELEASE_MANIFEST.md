@@ -1,19 +1,19 @@
-# Samba Manager 1.3.0 Release Manifest
+# Samba Manager 1.3.1 Release Manifest
 
-**Release Date**: Sat Jan 24 05:52:47 UTC 2026
-**Build System**: Linux
+**Release Date**: Thu Jul  2 07:48:44 MSK 2026
+**Build System**: Darwin
 **Release Manager**: Release Pack Builder Script
 
 ## Package Contents
 
 ### Archives
-- **samba-manager-1.3.0.tar.gz** (GNU tar + gzip)
-  - Size: 180K
-  - SHA256: 6055d5a38cbad50da734a328503f726a436fccffeedcab057ab814ba66327eb7
+- **samba-manager-1.3.1.tar.gz** (GNU tar + gzip)
+  - Size: 196K
+  - SHA256: be1e45c00c296eecd06888b114014c84d83198f9e456a9b96e7f072e8255e846
 
-- **samba-manager-1.3.0.zip** (ZIP format)
-  - Size: 200K
-  - SHA256: 1b32cf319b2889747c4a7731c4ffc9f49479c1b127dae80eb2b72b45e87b67b8
+- **samba-manager-1.3.1.zip** (ZIP format)
+  - Size: 212K
+  - SHA256: c365970e457f9c32d213e0c51bd38828b22ba0d4553ccdf435373562378dc3cb
 
 ### Documentation
 - RELEASE_NOTES.md - Release notes and installation guide
@@ -35,16 +35,16 @@
 
 1. **Automated Installation**
    ```bash
-   tar -xzf samba-manager-1.3.0.tar.gz
-   cd samba-manager-1.3.0
+   tar -xzf samba-manager-1.3.1.tar.gz
+   cd samba-manager-1.3.1
    sudo ./install.sh
    ```
 
 2. **Docker Deployment**
    ```bash
-   cd samba-manager-1.3.0
-   docker build -t samba-manager:1.3.0 .
-   docker run -p 5000:5000 -v /etc/samba:/etc/samba samba-manager:1.3.0
+   cd samba-manager-1.3.1
+   docker build -t samba-manager:1.3.1 .
+   docker run -p 5000:5000 -v /etc/samba:/etc/samba samba-manager:1.3.1
    ```
 
 ## Checksum Verification
@@ -57,8 +57,8 @@ sha256sum -c checksums.txt
 
 Expected output:
 ```
-samba-manager-1.3.0.tar.gz: OK
-samba-manager-1.3.0.zip: OK
+samba-manager-1.3.1.tar.gz: OK
+samba-manager-1.3.1.zip: OK
 ```
 
 ## Quick Start
@@ -90,5 +90,5 @@ See LICENSE file in the package for details.
 ---
 
 Built by: Release Pack Builder Script
-Build Date: 2026-01-24 05:52:47
+Build Date: 2026-07-02 07:48:44
 

@@ -11,10 +11,23 @@ services:
       - "139:139"    # NetBIOS
       - "445:445"    # SMB
     volumes:
+      # ВНИМАНИЕ: reconciler пишет в /etc/samba/shares.conf и share_profiles.json.
+      # Если монтируете /etc/samba с хоста — НЕ используйте :ro, иначе записи упадут.
       - /etc/samba:/etc/samba:ro
       - /var/log/samba:/var/log/samba
       - samba-manager-logs:/var/log/samba-manager
       - samba-manager-users:/opt/samba-manager/data
+      # Проброс каталога, куда devmon/udevil монтирует внешние диски (подставьте свой путь).
+      # propagation: rslave ОБЯЗАТЕЛЕН — иначе диски, смонтированные ПОСЛЕ старта
+      # контейнера, не видны внутри (симптом: пустая шара / "Waiting Disk" до рестарта).
+      # - type: bind
+      #   source: /media/devmon
+      #   target: /shares
+      #   bind:
+      #     propagation: rslave
+      # Fallback, если поменять propagation нельзя: пробросить конкретный mountpoint
+      #   - /media/devmon/VGJR3XZK:/shares/VGJR3XZK:rslave
+      # либо перезапускать контейнер после монтирования диска.
     environment:
       - SAMBA_MANAGER_SECRET_KEY=${SAMBA_MANAGER_SECRET_KEY:-change-me-in-production}
       - FLASK_ENV=production

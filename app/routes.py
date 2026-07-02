@@ -1491,6 +1491,16 @@ def api_shares():
     return jsonify(shares_json)
 
 
+@bp.route("/api/shares/<name>/diagnostics", methods=["GET"])
+@login_required
+def api_share_diagnostics(name):
+    """Diagnose why a share path is / isn't visible inside the container."""
+    for s in list_managed_shares():
+        if s["name"] == name:
+            return jsonify(collect_share_diagnostics(s.get("path", "")))
+    return jsonify({"error": "not found"}), 404
+
+
 @bp.route("/api/status", methods=["GET"])
 @login_required
 def api_status():

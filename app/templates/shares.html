@@ -67,7 +67,10 @@
                 {% if share.runtime_state == 'online' %}
                 <span class="badge bg-success">Enabled</span>
                 {% elif share.runtime_state == 'offline' %}
-                <span class="badge bg-warning">Waiting Disk</span>
+                <span class="badge bg-warning" title="{{ share.runtime_note }}">Waiting Disk</span>
+                <button type="button" class="btn btn-sm btn-link p-0 ms-1 diagnose-btn" data-share-name="{{ share.name }}" title="Diagnose">
+                  <i class="bi bi-search"></i>
+                </button>
                 {% else %}
                 <span class="badge bg-info">Enabled</span>
                 {% endif %}
@@ -641,6 +644,39 @@ document.addEventListener('DOMContentLoaded', () => {
     const sourceModalEl = document.getElementById(currentSourceModalId);
     if (sourceModalEl && !sourceModalEl.classList.contains('show')) {
       bootstrap.Modal.getOrCreateInstance(sourceModalEl).show();
+    }
+  });
+});
+
+function showTopAlert(html, category) {
+  const content = document.querySelector('.content');
+  if (!content) return;
+  const el = document.createElement('div');
+  el.className = `alert alert-${category} alert-dismissible fade show`;
+  el.setAttribute('role', 'alert');
+  el.innerHTML = html +
+    '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>';
+  content.insertBefore(el, content.firstChild);
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+document.querySelectorAll('.diagnose-btn').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const name = btn.dataset.shareName;
+    try {
+      const resp = await fetch(`/api/shares/${encodeURIComponent(name)}/diagnostics`);
+      const d = await resp.json();
+      showTopAlert(
+        `<strong>Диагностика шары «${name}»</strong>` +
+        `<div class="small mt-1">Path: ${d.path}<br>` +
+        `Exists: ${d.exists} · Mountpoint: ${d.is_mountpoint} · ` +
+        `Udevil stub (диск не смонтирован в контейнере): ${d.is_udevil_stub} · ` +
+        `Entries: ${d.entry_count}</div>` +
+        `<pre class="small mb-0 mt-1">${(d.findmnt || '(нет данных findmnt)')}</pre>`,
+        'danger'
+      );
+    } catch (e) {
+      showTopAlert('Diagnostics failed: ' + e, 'danger');
     }
   });
 });

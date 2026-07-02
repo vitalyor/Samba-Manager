@@ -1053,6 +1053,21 @@ def _resolve_profile_disk_mount(profile, disks):
     return None
 
 
+_STUB_NOTE = (
+    "Диск не виден внутри контейнера — проверьте mount propagation (rslave) "
+    "или перезапустите контейнер"
+)
+
+
+def _is_udevil_stub(path):
+    # ponytail: маркер .udevil-mount-point виден только когда реальный fs
+    # НЕ примонтирован поверх (внутри нашего mount namespace).
+    try:
+        return os.path.exists(os.path.join(path, ".udevil-mount-point"))
+    except Exception:
+        return False
+
+
 def _resolved_share_from_profile(profile, disks):
     mode = (profile.get("mode") or "path").strip().lower()
     enabled = bool(profile.get("enabled", True))
@@ -1060,6 +1075,7 @@ def _resolved_share_from_profile(profile, disks):
     share_name = normalize_share_name(profile.get("name"))
     share_data["name"] = share_name
     profile["runtime_state"] = "disabled" if not enabled else "unknown"
+    profile["runtime_note"] = ""
 
     if not enabled:
         return None
@@ -1079,20 +1095,55 @@ def _resolved_share_from_profile(profile, disks):
             return None
         profile["resolved_path"] = resolved_path
         share_data["path"] = resolved_path
+        if _is_udevil_stub(resolved_path):
+            profile["runtime_state"] = "offline"
+            profile["runtime_note"] = _STUB_NOTE
+            return None
         profile["runtime_state"] = "online"
         return share_data
 
     # path mode
     fixed_path = (share_data.get("path") or profile.get("resolved_path") or "").strip()
     profile["resolved_path"] = fixed_path
+    share_data["path"] = fixed_path
+    if fixed_path and _is_udevil_stub(fixed_path):
+        # Заглушка udevil: путь существует, но реальный диск не примонтирован.
+        profile["runtime_state"] = "offline"
+        profile["runtime_note"] = _STUB_NOTE
+        return None
     path_exists = bool(fixed_path and os.path.exists(fixed_path))
     profile["runtime_state"] = "online" if path_exists else "offline"
-    share_data["path"] = fixed_path
     # Keep path-mode shares visible in UI as "Waiting Disk", but do not publish
     # them in Samba while the backing path is missing.
     if not path_exists:
         return None
     return share_data
+
+
+def collect_share_diagnostics(path):
+    info = {
+        "path": path,
+        "exists": os.path.exists(path) if path else False,
+        "is_mountpoint": os.path.ismount(path) if path else False,
+        "is_udevil_stub": _is_udevil_stub(path) if path else False,
+        "entry_count": None,
+        "findmnt": "",
+    }
+    try:
+        info["entry_count"] = len(os.listdir(path))
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            with_privilege(["findmnt", "-T", path, "-o", "TARGET,SOURCE,FSTYPE,PROPAGATION"]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        info["findmnt"] = (r.stdout or r.stderr or "").strip()
+    except Exception:
+        pass
+    return info
 
 
 def _render_shares_conf_content(shares):
@@ -1281,6 +1332,7 @@ def list_managed_shares():
             share["disk_id"] = (profile.get("disk") or {}).get("disk_id", "")
             share["relative_path"] = profile.get("relative_path", "/")
             share["runtime_state"] = profile.get("runtime_state", "unknown")
+            share["runtime_note"] = profile.get("runtime_note", "")
             share.setdefault("comment", "")
             share.setdefault("browseable", "yes")
             share.setdefault("read_only", "no")

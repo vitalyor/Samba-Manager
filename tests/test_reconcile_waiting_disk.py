@@ -125,6 +125,55 @@ class TestReconcileWaitingDisk(unittest.TestCase):
         self.assertTrue(second_ok)
         reset_mock.assert_called_once_with("OFFLINE")
 
+    def test_udevil_stub_not_published_then_recovers(self):
+        # Путь существует, но внутри маркер udevil = реальный диск НЕ смонтирован.
+        stub_path = self.base / "stub-share"
+        stub_path.mkdir(parents=True, exist_ok=True)
+        marker = stub_path / ".udevil-mount-point"
+        marker.write_text("")
+
+        doc = {
+            "version": 1,
+            "shares": [
+                {
+                    "name": "STUB",
+                    "enabled": True,
+                    "mode": "path",
+                    "disk": {"disk_id": "", "partuuid": "", "uuid": "", "serial": "", "wwn": ""},
+                    "relative_path": "/",
+                    "resolved_path": str(stub_path),
+                    "runtime_state": "unknown",
+                    "share": {
+                        "path": str(stub_path),
+                        "browseable": "yes",
+                        "read_only": "no",
+                        "guest_ok": "no",
+                        "valid_users": "vitalyor",
+                    },
+                }
+            ],
+        }
+        samba_utils._save_profile_doc(doc)
+
+        with patch.object(samba_utils, "_validate_shares_content", return_value=True):
+            self.assertTrue(samba_utils.reconcile_share_profiles_once())
+
+        self.assertNotIn("[STUB]", self.share_conf.read_text())
+        ui = {s["name"]: s for s in samba_utils.list_managed_shares()}
+        self.assertEqual(ui["STUB"]["runtime_state"], "offline")
+        self.assertTrue(ui["STUB"]["runtime_note"])
+
+        # Диск примонтировался поверх → маркер исчезает → шара публикуется + refresh.
+        marker.unlink()
+        with patch.object(samba_utils, "_validate_shares_content", return_value=True):
+            with patch.object(
+                samba_utils, "_reset_share_sessions_after_reconnect"
+            ) as reset_mock:
+                self.assertTrue(samba_utils.reconcile_share_profiles_once())
+
+        self.assertIn("[STUB]", self.share_conf.read_text())
+        reset_mock.assert_called_once_with("STUB")
+
 
 if __name__ == "__main__":
     unittest.main()

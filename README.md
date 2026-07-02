@@ -215,6 +215,31 @@ docker-compose up
 
 For more details, see the [releases/docker/](releases/docker/) directory.
 
+### External disks & mount propagation
+
+If external disks are mounted on the host **after** the container starts (e.g. via
+`devmon`/`udevil` into `/media/devmon/<disk>`), the bind mount **must** use `rslave`
+propagation — otherwise those mounts never become visible inside the container and the
+share opens empty (or stays "Waiting Disk") until the container is restarted:
+
+```yaml
+volumes:
+  - type: bind
+    source: /media/devmon
+    target: /shares
+    bind:
+      propagation: rslave
+```
+
+Fallbacks if you can't change propagation: bind the specific mountpoint directly
+(`/media/devmon/<disk>:/shares/<disk>:rslave`), or restart the container after mounting.
+Samba Manager detects the `udevil` mount stub and keeps such shares as "Waiting Disk"
+(with a Diagnose button) instead of publishing an empty share; it auto-recovers once the
+real mount becomes visible.
+
+Note: the reconciler writes to `/etc/samba/shares.conf` and `share_profiles.json`, so if
+you bind-mount `/etc/samba` from the host do **not** mount it read-only (`:ro`).
+
 ## Release Management System
 
 Samba Manager includes a comprehensive release management system with automated tools:
